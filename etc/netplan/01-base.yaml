@@ -1,0 +1,35 @@
+#root@pocgen111:/etc/netplan# cat 01-base.yaml
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ens1f1np1:
+      dhcp4: false
+      addresses:
+        - 172.18.4.19/20
+      nameservers:
+        addresses:
+          - 172.31.7.10
+          - 172.31.0.10
+        search: [cec.dev.local]
+      routes:
+        - to: default
+          via: 172.16.0.1
+
+    ens14f0np0:
+      dhcp4: false
+      addresses: [172.16.0.126/20]
+      nameservers:
+        addresses:
+          - 172.31.7.10
+          - 172.31.0.10
+        search: [cec.dev.local]
+
+    ens14f1np1:
+      dhcp4: false
+      addresses: [172.16.0.114/20]
+      nameservers:
+        addresses:
+          - 172.31.7.10
+          - 172.31.0.10
+        search: [cec.dev.local]
