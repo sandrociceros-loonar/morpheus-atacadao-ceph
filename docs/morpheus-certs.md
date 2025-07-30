@@ -1,4 +1,4 @@
-# Instrução: Arquivos necessários para nonfigurar SSL/TLS no Morpheus Data
+# Instrução: Arquivos necessários para configurar SSL/TLS no Morpheus Data
 
 ## 1. Chave Privada (.key)
 

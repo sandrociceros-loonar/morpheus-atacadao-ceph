@@ -1,0 +1,4 @@
+# evita certificados ssl
+*.pem
+*.crt
+*.key
