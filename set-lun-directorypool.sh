@@ -1,5 +1,8 @@
 #!/bin/bash
 
+#TODO: Prever se o device multipath já pode ter sido formatado e montado numa execução anterior. Perguntar se deseja formatar novamente ou montar o existente.
+
+
 # Função erro e sair
 function error_exit {
   echo "Erro: $1"
