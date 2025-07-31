@@ -65,9 +65,16 @@ echo "✔ Nome do volume GFS2: $VOLUME_NAME"
 echo "✔ Identificador completo do filesystem: $CLUSTER_NAME:$VOLUME_NAME"
 echo
 
-# === VERIFICA E CONFIGURA STONITH DUMMY SE NÃO EXISTE (apenas para laboratório!) ===
-STONITH_OK=$(sudo pcs stonith show 2>/dev/null | grep fence_dummy)
-if [ -z "$STONITH_OK" ]; then
+# === VERIFICA E CONFIGURA STONITH DUMMY SE NÃO EXISTE (melhorado) ===
+
+# Primeiro, verificar se já existe algum recurso STONITH configurado
+EXISTING_STONITH=$(sudo pcs stonith show 2>/dev/null)
+
+if [ -n "$EXISTING_STONITH" ]; then
+    echo "✔ Recursos STONITH já configurados no cluster:"
+    echo "$EXISTING_STONITH"
+    echo "Prosseguindo com configuração existente de fencing."
+else
     echo
     echo "ATENÇÃO: O cluster NÃO possui fencing (STONITH) configurado."
     echo "Sem fencing, GFS2/DLM podem recusar operações ou ficar instáveis."
@@ -118,37 +125,53 @@ if [ -z "$STONITH_OK" ]; then
         if [[ "$ADDSTONITH" == "s" || "$ADDSTONITH" == "y" ]]; then
             echo "Criando STONITH dummy para laboratório..."
             
-            # Tenta detectar nós automaticamente
-            NODELIST=$(sudo pcs status nodes 2>/dev/null | grep -oE "[a-zA-Z0-9._-]+" | grep -v -E "(Online|Offline|Standby|Maintenance|resource|running|Remote|Nodes|Pacemaker|with)" | tr '\n' ',' | sed 's/,$//')
-            
-            if [ -z "$NODELIST" ] || [[ "$NODELIST" =~ ^,*$ ]]; then
-                echo "Não foi possível detectar nós automaticamente."
-                read -p "Informe a lista de nós separada por vírgula (ex: fc-test1,fc-test2): " NODELIST
-                NODELIST=${NODELIST// /}
-            fi
-            
-            if [ -n "$NODELIST" ]; then
-                echo "Criando STONITH dummy para nós: $NODELIST"
-                sudo pcs stonith create my-fake-fence fence_dummy pcmk_host_list="${NODELIST}" || {
-                    echo "⚠️ Falha ao criar STONITH dummy via pcs."
-                    echo "Para laboratório, você pode desabilitar STONITH completamente:"
-                    echo "sudo pcs property set stonith-enabled=false"
-                    read -p "Deseja desabilitar STONITH para este laboratório? [s/N]: " DISABLE_STONITH
-                    DISABLE_STONITH=$(echo "${DISABLE_STONITH:-n}" | tr '[:upper:]' '[:lower:]')
-                    if [[ "$DISABLE_STONITH" == "s" || "$DISABLE_STONITH" == "y" ]]; then
-                        sudo pcs property set stonith-enabled=false
-                        echo "✔ STONITH desabilitado para laboratório"
-                    fi
-                }
-                echo "✔ STONITH dummy configurado: my-fake-fence (nodes: $NODELIST)"
-                sleep 2
+            # Verificar se o recurso 'my-fake-fence' já existe
+            if sudo pcs stonith show my-fake-fence &>/dev/null; then
+                echo "✔ Recurso STONITH 'my-fake-fence' já existe no cluster."
+                echo "Verificando status do recurso existente..."
+                sudo pcs stonith show my-fake-fence
+                echo "Prosseguindo com o recurso STONITH existente."
             else
-                error_exit "Lista de nós não pode estar vazia para STONITH"
+                # Tenta detectar nós automaticamente
+                NODELIST=$(sudo pcs status nodes 2>/dev/null | grep -oE "[a-zA-Z0-9._-]+" | grep -v -E "(Online|Offline|Standby|Maintenance|resource|running|Remote|Nodes|Pacemaker|with)" | tr '\n' ',' | sed 's/,$//')
+                
+                if [ -z "$NODELIST" ] || [[ "$NODELIST" =~ ^,*$ ]]; then
+                    echo "Não foi possível detectar nós automaticamente."
+                    read -p "Informe a lista de nós separada por vírgula (ex: fc-test1,fc-test2): " NODELIST
+                    NODELIST=${NODELIST// /}
+                fi
+                
+                if [ -n "$NODELIST" ]; then
+                    echo "Criando STONITH dummy para nós: $NODELIST"
+                    if sudo pcs stonith create my-fake-fence fence_dummy pcmk_host_list="${NODELIST}"; then
+                        echo "✔ STONITH dummy criado com sucesso: my-fake-fence (nodes: $NODELIST)"
+                    else
+                        echo "⚠️ Falha ao criar STONITH dummy via pcs."
+                        echo "Para laboratório, você pode desabilitar STONITH completamente:"
+                        echo "sudo pcs property set stonith-enabled=false"
+                        read -p "Deseja desabilitar STONITH para este laboratório? [s/N]: " DISABLE_STONITH
+                        DISABLE_STONITH=$(echo "${DISABLE_STONITH:-n}" | tr '[:upper:]' '[:lower:]')
+                        if [[ "$DISABLE_STONITH" == "s" || "$DISABLE_STONITH" == "y" ]]; then
+                            sudo pcs property set stonith-enabled=false
+                            echo "✔ STONITH desabilitado para laboratório"
+                        fi
+                    fi
+                    sleep 2
+                else
+                    error_exit "Lista de nós não pode estar vazia para STONITH"
+                fi
             fi
         fi
     else
         echo "Prosseguindo sem STONITH dummy."
         echo "⚠️ AVISO: GFS2 pode recusar montagem sem fencing configurado."
+        echo "Para laboratório, você pode desabilitar STONITH se necessário:"
+        read -p "Deseja desabilitar STONITH para este laboratório? [s/N]: " DISABLE_STONITH
+        DISABLE_STONITH=$(echo "${DISABLE_STONITH:-n}" | tr '[:upper:]' '[:lower:]')
+        if [[ "$DISABLE_STONITH" == "s" || "$DISABLE_STONITH" == "y" ]]; then
+            sudo pcs property set stonith-enabled=false
+            echo "✔ STONITH desabilitado para laboratório"
+        fi
     fi
 fi
 
