@@ -36,7 +36,7 @@
 # - Devices diretos (/dev/sd*)
 # - Ambientes físicos e virtualizados (Proxmox, VMware, etc.)
 #
-# VERSÃO: 2.3 - Melhorada limpeza de VGs existentes
+# VERSÃO: 2.4 - Limpeza manual robusta de VGs existentes
 ################################################################################
 
 function error_exit {
@@ -54,6 +54,116 @@ function check_service_active {
 
 function check_service_enabled {
     systemctl is-enabled --quiet "$1"
+}
+
+function force_cleanup_vg {
+    local vg_name="$1"
+    local device="$2"
+    
+    echo "=== Iniciando limpeza robusta do VG: $vg_name ==="
+    
+    # 1. Verificar processos usando o VG
+    echo "Verificando processos que podem estar usando o VG..."
+    PROCESSES=$(sudo lsof /dev/$vg_name/* 2>/dev/null | grep -v COMMAND || true)
+    if [ -n "$PROCESSES" ]; then
+        echo "⚠️ Processos detectados usando o VG:"
+        echo "$PROCESSES"
+        read -p "Tentar continuar mesmo assim? [s/N]: " CONTINUE_WITH_PROCESSES
+        CONTINUE_WITH_PROCESSES=${CONTINUE_WITH_PROCESSES,,}
+        if [[ "$CONTINUE_WITH_PROCESSES" != "s" && "$CONTINUE_WITH_PROCESSES" != "y" ]]; then
+            echo "Pare os processos listados e execute o script novamente."
+            return 1
+        fi
+    fi
+    
+    # 2. Forçar desativação de todos os LVs
+    echo "Forçando desativação de Logical Volumes..."
+    sudo lvchange -an $vg_name --force 2>/dev/null || true
+    sleep 2
+    
+    # 3. Remover cada LV individualmente
+    echo "Removendo Logical Volumes individualmente..."
+    local lvs_list=$(sudo lvs --noheadings -o lv_name $vg_name 2>/dev/null | tr -d ' ' || true)
+    for lv in $lvs_list; do
+        if [ -n "$lv" ]; then
+            echo "Removendo LV: $lv"
+            sudo lvremove -f /dev/$vg_name/$lv 2>/dev/null || true
+        fi
+    done
+    
+    # 4. Desativar o VG
+    echo "Desativando Volume Group..."
+    sudo vgchange -an $vg_name 2>/dev/null || true
+    sleep 2
+    
+    # 5. Remover VG forçadamente
+    echo "Removendo Volume Group forçadamente..."
+    sudo vgremove -f $vg_name 2>/dev/null || true
+    sleep 2
+    
+    # 6. Remover Physical Volume
+    echo "Removendo Physical Volume do device..."
+    sudo pvremove -f "$device" 2>/dev/null || true
+    sleep 2
+    
+    # 7. Atualizar cache do LVM
+    echo "Atualizando cache do LVM..."
+    sudo vgscan --cache 2>/dev/null || true
+    sudo pvscan --cache 2>/dev/null || true
+    
+    # 8. Verificar se foi removido completamente
+    if sudo vgdisplay $vg_name &>/dev/null; then
+        echo "❌ VG '$vg_name' ainda existe após tentativas de remoção."
+        echo "Verificando detalhes restantes..."
+        sudo vgdisplay $vg_name 2>/dev/null || true
+        sudo lvs $vg_name 2>/dev/null || true
+        
+        echo ""
+        echo "=== OPÇÕES DE LIMPEZA ADICIONAL ==="
+        echo "1. Tentar remoção mais agressiva"
+        echo "2. Reiniciar sistema e tentar novamente" 
+        echo "3. Usar device direto (sem LVM)"
+        echo "4. Abortar script"
+        read -p "Escolha uma opção [1-4]: " CLEANUP_OPTION
+        
+        case $CLEANUP_OPTION in
+            1)
+                echo "Tentando remoção mais agressiva..."
+                # Remoção mais agressiva
+                sudo dmsetup remove_all --force 2>/dev/null || true
+                sudo vgremove -f $vg_name 2>/dev/null || true
+                sudo pvremove -f "$device" 2>/dev/null || true
+                # Verificar novamente
+                if sudo vgdisplay $vg_name &>/dev/null; then
+                    echo "❌ Falha na remoção agressiva. Remoção manual necessária."
+                    return 1
+                else
+                    echo "✔ VG removido com remoção agressiva."
+                    return 0
+                fi
+                ;;
+            2)
+                echo "💡 Recomendação: Reinicie o sistema com 'sudo reboot' e execute o script novamente."
+                exit 1
+                ;;
+            3)
+                echo "💡 Será usado o device direto $device no próximo script."
+                echo "Execute configure-lun-multipath.sh e selecione o device $device diretamente."
+                return 2  # Código especial para usar device direto
+                ;;
+            4)
+                echo "Script abortado pelo usuário."
+                exit 1
+                ;;
+            *)
+                echo "Opção inválida. Abortando."
+                return 1
+                ;;
+        esac
+    else
+        echo "✔ VG '$vg_name' removido com sucesso."
+        return 0
+    fi
 }
 
 echo "==== Preparando ambiente Ubuntu 22.04 para LUN GFS2 em cluster ===="
@@ -241,7 +351,7 @@ for clustsvc in corosync pacemaker; do
     fi
 done
 
-# === Configuração automática de Volume LVM Compartilhado (Melhorada) ===
+# === Configuração automática de Volume LVM Compartilhado (Com Limpeza Robusta) ===
 echo "Verificando e configurando Volumes Lógicos LVM para compartilhar a LUN..."
 
 # Verificar se já existe volume compartilhado
@@ -316,7 +426,7 @@ else
     if [[ "$CREATE_LVM" == "s" || "$CREATE_LVM" == "y" ]]; then
         echo "Criando Volume Group compartilhado..."
         
-        # === SEÇÃO MELHORADA: Limpeza robusta de VGs existentes ===
+        # === SEÇÃO MELHORADA: Limpeza robusta com função especializada ===
         
         # Verificar se VG 'vg_cluster' já existe
         if sudo vgdisplay vg_cluster &>/dev/null; then
@@ -324,52 +434,18 @@ else
             read -p "Deseja remover completamente e recriar? [s/N]: " RECREATE_VG
             RECREATE_VG=${RECREATE_VG,,}
             if [[ "$RECREATE_VG" == "s" || "$RECREATE_VG" == "y" ]]; then
-                echo "Removendo VG anterior completamente..."
+                # Usar função de limpeza robusta
+                force_cleanup_vg "vg_cluster" "$SELECTED_DEVICE"
+                CLEANUP_RESULT=$?
                 
-                # 1. Desativar todos os LVs do VG
-                echo "Desativando Logical Volumes..."
-                sudo lvchange -an vg_cluster 2>/dev/null || true
-                
-                # 2. Remover todos os LVs do VG
-                echo "Removendo Logical Volumes..."
-                for lv in $(sudo lvs --noheadings -o lv_name vg_cluster 2>/dev/null | tr -d ' '); do
-                    sudo lvremove -f vg_cluster/$lv 2>/dev/null || true
-                done
-                
-                # 3. Remover VG forçadamente
-                echo "Removendo Volume Group..."
-                sudo vgremove -f vg_cluster 2>/dev/null || true
-                
-                # 4. Remover Physical Volume
-                echo "Removendo Physical Volume..."
-                sudo pvremove -f "$SELECTED_DEVICE" 2>/dev/null || true
-                
-                # 5. Verificar se foi removido
-                if sudo vgdisplay vg_cluster &>/dev/null; then
-                    error_exit "Falha ao remover VG 'vg_cluster' anterior. Remoção manual necessária."
-                else
-                    echo "✔ VG anterior removido completamente"
+                if [ $CLEANUP_RESULT -eq 1 ]; then
+                    error_exit "Falha na limpeza do VG. Intervenção manual necessária."
+                elif [ $CLEANUP_RESULT -eq 2 ]; then
+                    echo "✔ Configuração concluída. Use o device direto no próximo script."
+                    exit 0
                 fi
             else
                 error_exit "Não é possível prosseguir com VG existente."
-            fi
-        fi
-        
-        # Verificar se o device já está sendo usado por outro VG
-        if sudo pvdisplay "$SELECTED_DEVICE" &>/dev/null; then
-            echo "⚠️ Device $SELECTED_DEVICE já está sendo usado pelo LVM."
-            VG_NAME=$(sudo pvdisplay "$SELECTED_DEVICE" 2>/dev/null | grep "VG Name" | awk '{print $3}' | tr -d ' ')
-            if [ -n "$VG_NAME" ]; then
-                echo "Device pertence ao VG: $VG_NAME"
-                read -p "Deseja remover uso anterior e recriar? [s/N]: " RECREATE_PV
-                RECREATE_PV=${RECREATE_PV,,}
-                if [[ "$RECREATE_PV" == "s" || "$RECREATE_PV" == "y" ]]; then
-                    echo "Removendo uso anterior do device..."
-                    sudo vgremove -f "$VG_NAME" 2>/dev/null || true
-                    sudo pvremove -f "$SELECTED_DEVICE" 2>/dev/null || true
-                else
-                    error_exit "Não é possível prosseguir com device em uso."
-                fi
             fi
         fi
         
