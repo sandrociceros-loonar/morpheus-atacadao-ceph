@@ -1,5 +1,18 @@
 #!/bin/bash
 
+# Clear the screen before starting
+clear
+
+cat << "EOF"
+ _                                    _____ _                 _ 
+| |    ___   ___  _ __   __ _ _ __  / ____| |               | |
+| |   / _ \ / _ \| '_ \ / _` | '__|| |    | |     ___  _   _| |
+| |__| (_) | (_) | | | | (_| | |   | |____| |___ / _ \| | | | |
+|_____\___/ \___/|_| |_|\__,_|_|    \_____|_____| (_) |_|_|_|_|
+                                                                 
+EOF
+echo
+
 function error_exit {
     echo "Erro: $1"
     exit 1
@@ -17,20 +30,9 @@ function check_service_enabled {
     systemctl is-enabled --quiet "$1"
 }
 
-echo "==== Preparando ambiente Ubuntu para LUN GFS2 compartilhada em cluster ===="
+echo "==== Preparando ambiente Ubuntu 22.04 para LUN GFS2 em cluster ===="
 
-# Detectar versão do Ubuntu
-ubuntu_version=$(lsb_release -rs)
-
-# Ajustar nomes dos pacotes conforme a versão do Ubuntu
-if [[ "$ubuntu_version" == "22.04" ]]; then
-    PKGS=(gfs2-utils corosync dlm lvmlockd pcs lvm2 multipath-tools)
-elif [[ "$ubuntu_version" == "24.04" ]]; then
-    PKGS=(gfs2-utils corosync dlm lvm2-lockd pcs lvm2 multipath-tools)
-else
-    error_exit "Versão do Ubuntu não suportada: $ubuntu_version"
-fi
-
+PKGS=(gfs2-utils corosync dlm-controld lvm2-lockd pcs lvm2 multipath-tools)
 MISSING=()
 
 echo "Checando pacotes necessários..."
@@ -47,11 +49,11 @@ if [ ${#MISSING[@]} -ne 0 ]; then
     echo "Instalará estes pacotes essenciais para cluster e multipath:"
     echo "- gfs2-utils: suporte a sistema de arquivos GFS2"
     echo "- corosync: comunicação do cluster"
-    echo "- dlm: Distributed Lock Manager"
-    echo "- lvmlockd: bloqueio para LVM compartilhado"
-    echo "- pcs: ferramenta para gerenciar pacemaker/corosync"
-    echo "- lvm2: gerenciador de volumes lógicos"
-    echo "- multipath-tools: gerenciador de multipath para storage"
+    echo "- dlm-controld: Distributed Lock Manager"
+    echo "- lvm2-lockd: lock do LVM para clusters"
+    echo "- pcs: gerenciador Pacemaker/Corosync"
+    echo "- lvm2: volumes lógicos"
+    echo "- multipath-tools: multipath para SAN/iSCSI/FC"
     read -p "Deseja instalar agora? [s/N]: " ans
     ans=${ans,,}
     if [[ $ans == "s" || $ans == "y" ]]; then
@@ -64,23 +66,8 @@ else
     echo "✔ Todos os pacotes necessários já estão instalados."
 fi
 
-# Verificar se o pacote dlm está disponível nos repositórios
-if ! apt-cache show dlm &>/dev/null; then
-    echo "⚠️  O pacote 'dlm' não está disponível nos repositórios padrão."
-    echo "Certifique-se de que o repositório correto está configurado ou instale manualmente o pacote necessário."
-    echo "Para Ubuntu 24.04, o pacote pode ter sido renomeado ou movido para outro repositório."
-    read -p "Deseja continuar sem instalar 'dlm'? [s/N]: " r
-    r=${r,,}
-    if [[ $r != "s" && $r != "y" ]]; then
-        error_exit "Pacote 'dlm' ausente. Abortando."
-    fi
-    # Remover 'dlm' da lista de pacotes a serem instalados
-    PKGS=("${PKGS[@]/dlm}")
-fi
-
-# Serviços essenciais
-SERVICOS=(multipathd dlm lvmlockd)
-for serv in "${SERVICOS[@]}"; do
+# Serviços principais (DLM/multipathd via systemctl)
+for serv in multipathd dlm_controld; do
     echo "Verificando serviço $serv..."
     active=0
     enabled=0
@@ -102,7 +89,36 @@ for serv in "${SERVICOS[@]}"; do
     fi
 done
 
-# Verificação de cluster corosync/pacemaker
+# Checagem especial para lvmlockd (não há unit systemd por padrão)
+echo "Verificando daemon lvmlockd (lock manager do LVM para cluster)..."
+if [ -x /usr/sbin/lvmlockd ]; then
+    echo "✔ Binário lvmlockd disponível em /usr/sbin/lvmlockd."
+    if pgrep -x lvmlockd >/dev/null; then
+        echo "✔ lvmlockd já está rodando."
+    else
+        echo "⚠️ O daemon lvmlockd NÃO está rodando."
+        read -p "Deseja iniciar o lvmlockd agora em background? (s/N): " RESP
+        RESP=${RESP,,}
+        if [[ $RESP == "s" || $RESP == "y" ]]; then
+            sudo /usr/sbin/lvmlockd -d &
+            echo "✔ lvmlockd iniciado em segundo plano (sem unit systemd padrão no Ubuntu 22.04)."
+        else
+            echo "⚠️ AVISO: lvmlockd não iniciado. O uso de LVM compartilhado pode não funcionar corretamente até iniciar o daemon."
+        fi
+    fi
+else
+    echo "❌ Binário lvmlockd não encontrado! Instale o pacote lvm2-lockd."
+    error_exit "lvmlockd ausente, não é possível prosseguir."
+fi
+
+# Assegure configuração mínima em /etc/lvm/lvm.conf
+echo "Ajustando configuração do LVM para cluster locking..."
+sudo sed -i 's/^ *use_lvmlockd *=.*/use_lvmlockd = 1/' /etc/lvm/lvm.conf || {
+    echo "use_lvmlockd = 1" | sudo tee -a /etc/lvm/lvm.conf
+}
+grep -q '^ *use_lvmlockd *= *1' /etc/lvm/lvm.conf && echo "✔ use_lvmlockd = 1 presente em /etc/lvm/lvm.conf"
+
+# Checagem dos serviços de cluster corosync/pacemaker
 echo "Verificando serviços de cluster corosync e pacemaker..."
 for clustsvc in corosync pacemaker; do
     if check_service_active "$clustsvc"; then
@@ -137,7 +153,7 @@ else
     echo "$lvs_sharing"
 fi
 
-# Verificação de hostname único (simples, exige ajuste manual)
+# Verificação de hostname único
 hostname=$(hostname)
 echo "Hostname atual: $hostname"
 echo "Verifique se ele é único entre os nós do cluster para evitar conflitos."
@@ -147,7 +163,7 @@ if [[ $r != "s" && $r != "y" ]]; then
     error_exit "Hostname deve ser exclusivo nos nós. Abortando."
 fi
 
-# Usuário e grupo para permissões conforme ambiente
+# Usuário/grupo para permissões se necessário
 if ! id "morpheus-node" &>/dev/null; then
     echo "Criando usuário 'morpheus-node' e grupo 'kvm' para permissões comuns ..."
     sudo groupadd -f kvm
@@ -165,7 +181,7 @@ cat << EOF
 - Configure e inicie corretamente o cluster Corosync e Pacemaker, editando /etc/corosync/corosync.conf para incluir os nós adequados.
 - Implemente STONITH (fencing) para garantir segurança do cluster e evitar corrupção.
 - Crie e ative o volume lógico LVM compartilhado com a opção --shared em ambos os nós.
-- Certifique-se de manter o hostname único e consistente em ambos os servidores.
+- Certifique-se de manter o hostname único e consistente nos servidores.
 - Após finalizar estas configurações manuais, prossiga com o script de configuração/montagem da LUN (ex: configure-lun-multipath.sh).
 
 EOF
