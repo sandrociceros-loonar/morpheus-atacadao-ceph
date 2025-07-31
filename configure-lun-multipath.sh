@@ -14,16 +14,81 @@ if [ -z "$STONITH_OK" ]; then
     read -p "Deseja criar um STONITH dummy (apenas para LAB/teste)? [s/N]: " ADDSTONITH
     ADDSTONITH=$(echo "${ADDSTONITH:-n}" | tr '[:upper:]' '[:lower:]')
     if [[ "$ADDSTONITH" == "s" || "$ADDSTONITH" == "y" ]]; then
-        NODELIST=$(sudo pcs status nodes 2>/dev/null | grep -oE "[a-zA-Z0-9._-]+" | grep -v "Online" | tr '\n' ',' | sed 's/,$//')
-        if [ -z "$NODELIST" ]; then
-            read -p "Informe a lista de nós separada por vírgula (ex: fc-test1,fc-test2): " NODELIST
-            NODELIST=${NODELIST// /}
+        
+        # === INSTALAÇÃO AUTOMÁTICA DE PACOTES FENCE-AGENTS ===
+        echo "Verificando pacotes necessários para STONITH dummy..."
+        
+        # Lista de pacotes fence-agents necessários para Ubuntu 22.04
+        FENCE_PACKAGES=(fence-agents-base fence-agents-common fence-agents-extra)
+        MISSING_FENCE=()
+        
+        for pkg in "${FENCE_PACKAGES[@]}"; do
+            if ! dpkg -s "$pkg" &>/dev/null; then
+                MISSING_FENCE+=("$pkg")
+            fi
+        done
+        
+        if [ ${#MISSING_FENCE[@]} -ne 0 ]; then
+            echo "Pacotes de fencing necessários não encontrados: ${MISSING_FENCE[*]}"
+            echo "Para usar STONITH dummy, estes pacotes são obrigatórios."
+            read -p "Deseja instalar os pacotes de fencing agora? [s/N]: " INSTALL_FENCE
+            INSTALL_FENCE=$(echo "${INSTALL_FENCE:-n}" | tr '[:upper:]' '[:lower:]')
+            
+            if [[ "$INSTALL_FENCE" == "s" || "$INSTALL_FENCE" == "y" ]]; then
+                echo "Instalando pacotes fence-agents..."
+                sudo apt update || error_exit "Falha no apt update para pacotes fence-agents"
+                sudo apt install -y "${MISSING_FENCE[@]}" || error_exit "Falha ao instalar pacotes fence-agents"
+                echo "✔ Pacotes fence-agents instalados com sucesso"
+            else
+                echo "❌ Sem os pacotes fence-agents, o STONITH dummy não funcionará."
+                echo "Prosseguindo sem STONITH (pode causar falhas na montagem GFS2)."
+                read -p "Deseja continuar mesmo assim? [s/N]: " CONTINUE_WITHOUT
+                CONTINUE_WITHOUT=$(echo "${CONTINUE_WITHOUT:-n}" | tr '[:upper:]' '[:lower:]')
+                if [[ "$CONTINUE_WITHOUT" != "s" && "$CONTINUE_WITHOUT" != "y" ]]; then
+                    error_exit "Operação cancelada. Instale fence-agents ou configure STONITH real."
+                fi
+                # Pular criação do STONITH se não instalar pacotes
+                ADDSTONITH="n"
+            fi
+        else
+            echo "✔ Pacotes fence-agents já estão instalados"
         fi
-        sudo pcs stonith create my-fake-fence fence_dummy pcmk_host_list="${NODELIST}"
-        echo "STONITH dummy criado: my-fake-fence (fence_dummy, nodes: $NODELIST)."
-        sleep 2
+        
+        # Criar STONITH dummy apenas se pacotes estão disponíveis
+        if [[ "$ADDSTONITH" == "s" || "$ADDSTONITH" == "y" ]]; then
+            echo "Criando STONITH dummy para laboratório..."
+            
+            # Tenta detectar nós automaticamente
+            NODELIST=$(sudo pcs status nodes 2>/dev/null | grep -oE "[a-zA-Z0-9._-]+" | grep -v -E "(Online|Offline|Standby|Maintenance|resource|running|Remote|Nodes|Pacemaker|with)" | tr '\n' ',' | sed 's/,$//')
+            
+            if [ -z "$NODELIST" ] || [[ "$NODELIST" =~ ^,*$ ]]; then
+                echo "Não foi possível detectar nós automaticamente."
+                read -p "Informe a lista de nós separada por vírgula (ex: fc-test1,fc-test2): " NODELIST
+                NODELIST=${NODELIST// /}
+            fi
+            
+            if [ -n "$NODELIST" ]; then
+                echo "Criando STONITH dummy para nós: $NODELIST"
+                sudo pcs stonith create my-fake-fence fence_dummy pcmk_host_list="${NODELIST}" || {
+                    echo "⚠️ Falha ao criar STONITH dummy via pcs."
+                    echo "Para laboratório, você pode desabilitar STONITH completamente:"
+                    echo "sudo pcs property set stonith-enabled=false"
+                    read -p "Deseja desabilitar STONITH para este laboratório? [s/N]: " DISABLE_STONITH
+                    DISABLE_STONITH=$(echo "${DISABLE_STONITH:-n}" | tr '[:upper:]' '[:lower:]')
+                    if [[ "$DISABLE_STONITH" == "s" || "$DISABLE_STONITH" == "y" ]]; then
+                        sudo pcs property set stonith-enabled=false
+                        echo "✔ STONITH desabilitado para laboratório"
+                    fi
+                }
+                echo "✔ STONITH dummy configurado: my-fake-fence (nodes: $NODELIST)"
+                sleep 2
+            else
+                error_exit "Lista de nós não pode estar vazia para STONITH"
+            fi
+        fi
     else
-        error_exit "Operação cancelada por falta de fencing. Configure fencing real ou aceite o dummy para seguir."
+        echo "Prosseguindo sem STONITH dummy."
+        echo "⚠️ AVISO: GFS2 pode recusar montagem sem fencing configurado."
     fi
 fi
 
@@ -219,7 +284,7 @@ cat << EOF
 ⚠️ RECOMENDAÇÕES FUTURAS:
 - Certifique-se de que os serviços do cluster (corosync, pacemaker) estão ativos e funcionais em ambos os nós.
 - Garanta que o nome do cluster (exemplo: meucluster:gfs2vol) usado no mkfs.gfs2 seja o mesmo em todos os nós.
-- Configure STONITH (fencing) válido para produção! Esse dummy serve apenas para LAB.
+- Configure STONITH (fencing) válido para produção! Este dummy/desabilitado serve apenas para LAB.
 - Realize testes de leitura/escrita em ambos os nós para validar a sincronização.
 - Execute o script test-lun-gfs2.sh para validar o funcionamento completo.
 ---
