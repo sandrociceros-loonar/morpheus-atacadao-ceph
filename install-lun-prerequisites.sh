@@ -36,7 +36,7 @@
 # - Devices diretos (/dev/sd*)
 # - Ambientes físicos e virtualizados (Proxmox, VMware, etc.)
 #
-# VERSÃO: 2.1 - Inclui correção configuração LVM para cluster
+# VERSÃO: 2.2 - Corrigido para compatibilidade total Ubuntu 22.04
 ################################################################################
 
 function error_exit {
@@ -198,23 +198,22 @@ else
     error_exit "lvmlockd ausente, não é possível prosseguir."
 fi
 
-# === Configuração LVM para Cluster (Seção Corrigida) ===
-echo "Configurando LVM adequadamente para cluster sharing..."
+# === Configuração LVM para Cluster (Adaptada para Ubuntu 22.04) ===
+echo "Configurando LVM adequadamente para cluster sharing (Ubuntu 22.04)..."
 
 # Backup da configuração atual
 sudo cp /etc/lvm/lvm.conf /etc/lvm/lvm.conf.backup.$(date +%Y%m%d_%H%M%S)
 
-# Remover configurações conflitantes
+# Remover configurações conflitantes ou incompatíveis
 sudo sed -i '/use_lvmlockd/d' /etc/lvm/lvm.conf
 sudo sed -i '/locking_type/d' /etc/lvm/lvm.conf  
 sudo sed -i '/shared_activation/d' /etc/lvm/lvm.conf
 
-# Aplicar configurações corretas para cluster
+# Aplicar APENAS configurações compatíveis com Ubuntu 22.04
 sudo sed -i '/^global {/a\    use_lvmlockd = 1\n    locking_type = 1' /etc/lvm/lvm.conf
-sudo sed -i '/^activation {/a\    shared_activation = 1' /etc/lvm/lvm.conf
 
-echo "✔ Configurações LVM para cluster aplicadas:"
-grep -E "(use_lvmlockd|locking_type|shared_activation)" /etc/lvm/lvm.conf
+echo "✔ Configurações LVM para cluster aplicadas (Ubuntu 22.04):"
+grep -E "(use_lvmlockd|locking_type)" /etc/lvm/lvm.conf
 
 # Reiniciar lvmlockd para aplicar configurações
 echo "Reiniciando lvmlockd para aplicar novas configurações..."
@@ -242,17 +241,17 @@ for clustsvc in corosync pacemaker; do
     fi
 done
 
-# === Configuração automática de Volume LVM Compartilhado ===
+# === Configuração automática de Volume LVM Compartilhado (Corrigida para Ubuntu 22.04) ===
 echo "Verificando e configurando Volumes Lógicos LVM para compartilhar a LUN..."
 
 # Verificar se já existe volume compartilhado
-lvs_sharing=$(sudo lvs -a -o vg_name,lv_name,lv_attr --noheadings 2>/dev/null | grep wz--s)
+lvs_sharing=$(sudo lvs -a -o vg_name,lv_name,lv_attr --noheadings 2>/dev/null | grep "w.*a")
 
 if [ -n "$lvs_sharing" ]; then
-    echo "✔ Volumes LVM compartilhados já existem:"
+    echo "✔ Volumes LVM já existem:"
     echo "$lvs_sharing"
 else
-    echo "⚠️ Nenhum volume lógico compartilhado encontrado."
+    echo "⚠️ Nenhum volume lógico encontrado para cluster."
     
     # Detectar devices disponíveis (multipath ou direto)
     CANDIDATE_DEVICES=()
@@ -305,19 +304,13 @@ else
         error_exit "Não foi possível determinar o tamanho do device $SELECTED_DEVICE"
     fi
     
-    # Calcular tamanho em GB (deixando margem de segurança de ~5%)
+    # Calcular tamanho em GB
     TOTAL_SIZE_GB=$((TOTAL_SIZE_BYTES / 1024 / 1024 / 1024))
-    USABLE_SIZE_GB=$((TOTAL_SIZE_GB * 95 / 100))
-    
-    # Mínimo de 1GB
-    if [ "$USABLE_SIZE_GB" -lt 1 ]; then
-        USABLE_SIZE_GB=1
-    fi
     
     echo "Tamanho total do device: ${TOTAL_SIZE_GB}GB"
-    echo "Tamanho utilizável (95%): ${USABLE_SIZE_GB}GB"
+    echo "Será usado TODO o espaço disponível para máximo aproveitamento."
     
-    read -p "Criar VG 'vg_cluster' e LV 'lv_gfs2' de ${USABLE_SIZE_GB}GB no device $SELECTED_DEVICE? [s/N]: " CREATE_LVM
+    read -p "Criar VG 'vg_cluster' e LV 'lv_gfs2' usando todo o espaço no device $SELECTED_DEVICE? [s/N]: " CREATE_LVM
     CREATE_LVM=${CREATE_LVM,,}
     
     if [[ "$CREATE_LVM" == "s" || "$CREATE_LVM" == "y" ]]; then
@@ -330,35 +323,38 @@ else
             RECREATE=${RECREATE,,}
             if [[ "$RECREATE" == "s" || "$RECREATE" == "y" ]]; then
                 # Remover configuração anterior de forma segura
-                sudo vgremove -f $(sudo pvdisplay "$SELECTED_DEVICE" | grep "VG Name" | awk '{print $3}') 2>/dev/null || true
+                VG_NAME=$(sudo pvdisplay "$SELECTED_DEVICE" 2>/dev/null | grep "VG Name" | awk '{print $3}')
+                if [ -n "$VG_NAME" ]; then
+                    sudo vgremove -f "$VG_NAME" 2>/dev/null || true
+                fi
                 sudo pvremove -f "$SELECTED_DEVICE" 2>/dev/null || true
             else
                 error_exit "Não é possível prosseguir com device em uso."
             fi
         fi
         
-        # Criar VG compartilhado
+        # Criar VG compartilhado (sintaxe correta Ubuntu 22.04)
         sudo vgcreate --shared vg_cluster "$SELECTED_DEVICE" || error_exit "Falha ao criar VG compartilhado"
         echo "✔ Volume Group 'vg_cluster' criado com sucesso"
         
-        # Criar LV compartilhado
-        sudo lvcreate --shared -n lv_gfs2 -L "${USABLE_SIZE_GB}G" vg_cluster || error_exit "Falha ao criar LV compartilhado"
-        echo "✔ Logical Volume 'lv_gfs2' criado com ${USABLE_SIZE_GB}GB"
+        # Criar LV usando TODO o espaço disponível (sintaxe correta Ubuntu 22.04)
+        sudo lvcreate -n lv_gfs2 -l 100%FREE vg_cluster || error_exit "Falha ao criar LV"
+        echo "✔ Logical Volume 'lv_gfs2' criado usando todo o espaço disponível"
         
-        # Ativar LV em modo compartilhado
-        sudo lvchange --activate sy /dev/vg_cluster/lv_gfs2 || error_exit "Falha ao ativar LV compartilhado"
-        echo "✔ Logical Volume ativado em modo compartilhado"
+        # Ativar LV (sintaxe correta Ubuntu 22.04)
+        sudo lvchange -ay /dev/vg_cluster/lv_gfs2 || error_exit "Falha ao ativar LV"
+        echo "✔ Logical Volume ativado com sucesso"
         
         # Verificar criação
-        echo "Verificando volumes compartilhados criados:"
-        sudo lvs -a -o vg_name,lv_name,lv_attr,lv_size --noheadings | grep wz--s
+        echo "Verificando volumes criados:"
+        sudo lvs -a -o vg_name,lv_name,lv_attr,lv_size
         
     else
-        echo "Criação de VG/LV compartilhado cancelada pelo usuário."
-        read -p "Deseja continuar sem volume compartilhado? [s/N]: " CONTINUE
+        echo "Criação de VG/LV cancelada pelo usuário."
+        read -p "Deseja continuar sem volume LVM? [s/N]: " CONTINUE
         CONTINUE=${CONTINUE,,}
         if [[ "$CONTINUE" != "s" && "$CONTINUE" != "y" ]]; then
-            error_exit "Volume compartilhado é necessário para cluster GFS2."
+            error_exit "Volume LVM é necessário para cluster GFS2."
         fi
     fi
 fi
@@ -391,10 +387,11 @@ cat << EOF
 - /etc/systemd/system/dlm_controld.service
 - /etc/systemd/system/lvmlockd.service
 
-✔ VOLUME LVM COMPARTILHADO:
+✔ VOLUME LVM CONFIGURADO:
 - Volume Group: vg_cluster
 - Logical Volume: lv_gfs2
 - Device: /dev/vg_cluster/lv_gfs2 (use este no próximo script)
+- Espaço: Todo o espaço disponível do device selecionado
 
 ⚠️ RECOMENDAÇÕES FUTURAS:
 - Execute este script no OUTRO NÓ do cluster também
