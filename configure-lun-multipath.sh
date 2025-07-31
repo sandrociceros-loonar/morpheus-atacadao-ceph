@@ -349,6 +349,7 @@ if [ ! -d "$MOUNT_POINT" ]; then
     sudo mkdir -p "$MOUNT_POINT" || error_exit "Falha ao criar diretório $MOUNT_POINT"
 fi
 
+# === Montagem com Correção Automática de Conflitos de Nomes ===
 echo "Montando $DEVICE em $MOUNT_POINT..."
 sudo mount -t gfs2 -o lockproto=lock_dlm,sync "$DEVICE" "$MOUNT_POINT" || {
     echo "⚠️ Falha na montagem. Verificando compatibilidade de nomes..."
@@ -357,14 +358,80 @@ sudo mount -t gfs2 -o lockproto=lock_dlm,sync "$DEVICE" "$MOUNT_POINT" || {
     if [ "$CLUSTER_NAME" != "$CURRENT_CLUSTER_NAME" ] && [ -n "$CURRENT_CLUSTER_NAME" ]; then
         echo "Detectado conflito de nomes do cluster!"
         echo "Filesystem: $CLUSTER_NAME | Cluster ativo: $CURRENT_CLUSTER_NAME"
-        echo "Corrigindo nome no filesystem..."
-        sudo tunegfs2 -T "$CURRENT_CLUSTER_NAME:$VOLUME_NAME" "$DEVICE"
-        CLUSTER_NAME="$CURRENT_CLUSTER_NAME"  # Atualizar variável para saída final
-        sudo mount -t gfs2 -o lockproto=lock_dlm,sync "$DEVICE" "$MOUNT_POINT" || error_exit "Falha persistente na montagem"
+        echo
+        echo "OPÇÕES DE CORREÇÃO:"
+        echo "1. Reformatar filesystem com nome correto do cluster ($CURRENT_CLUSTER_NAME)"
+        echo "2. Alterar configuração do cluster para usar nome do filesystem ($CLUSTER_NAME)"
+        echo "3. Continuar com falha (não recomendado)"
+        read -p "Escolha uma opção [1/2/3]: " FIX_OPTION
+        
+        case $FIX_OPTION in
+            1)
+                echo "Reformatando filesystem com nome correto do cluster..."
+                sudo umount "$DEVICE" 2>/dev/null || true
+                sudo wipefs -a "$DEVICE"
+                echo "y" | sudo mkfs.gfs2 -j2 -p lock_dlm -t "$CURRENT_CLUSTER_NAME:$VOLUME_NAME" "$DEVICE"
+                CLUSTER_NAME="$CURRENT_CLUSTER_NAME"  # Atualizar variável
+                
+                # Recarregar daemon systemd (conforme sugerido pelo sistema)
+                sudo systemctl daemon-reload
+                
+                sudo mount -t gfs2 -o lockproto=lock_dlm,sync "$DEVICE" "$MOUNT_POINT" || error_exit "Falha persistente na montagem após reformatação"
+                echo "✔ Filesystem reformatado e montado com sucesso"
+                ;;
+            2)
+                echo "⚠️ ATENÇÃO: Esta opção requer parar o cluster inteiro!"
+                echo "O cluster será parado, reconfigurado e reiniciado."
+                read -p "Deseja continuar? [s/N]: " CONFIRM_CLUSTER_CHANGE
+                CONFIRM_CLUSTER_CHANGE=$(echo "${CONFIRM_CLUSTER_CHANGE:-n}" | tr '[:upper:]' '[:lower:]')
+                
+                if [[ "$CONFIRM_CLUSTER_CHANGE" == "s" || "$CONFIRM_CLUSTER_CHANGE" == "y" ]]; then
+                    echo "Parando cluster..."
+                    sudo pcs cluster stop --all
+                    
+                    echo "Alterando nome do cluster para $CLUSTER_NAME..."
+                    sudo sed -i "s/cluster_name:.*/cluster_name: $CLUSTER_NAME/" /etc/corosync/corosync.conf
+                    
+                    echo "Reiniciando cluster..."
+                    sudo pcs cluster start --all
+                    sleep 5
+                    
+                    echo "Tentando montagem novamente..."
+                    sudo systemctl daemon-reload
+                    sudo mount -t gfs2 -o lockproto=lock_dlm,sync "$DEVICE" "$MOUNT_POINT" || error_exit "Falha na montagem após reconfiguração do cluster"
+                    echo "✔ Cluster reconfigurado e filesystem montado com sucesso"
+                else
+                    error_exit "Reconfiguração do cluster cancelada pelo usuário"
+                fi
+                ;;
+            3)
+                error_exit "Montagem cancelada devido a conflito de nomes não resolvido"
+                ;;
+            *)
+                error_exit "Opção inválida selecionada"
+                ;;
+        esac
     else
-        error_exit "Falha ao montar $DEVICE em $MOUNT_POINT"
+        # Verificar logs do sistema para outros erros
+        echo "Verificando logs do sistema para diagnóstico..."
+        echo "Últimas mensagens do kernel relacionadas ao GFS2:"
+        sudo dmesg | tail -10 | grep -i gfs2 || echo "Nenhuma mensagem GFS2 encontrada"
+        echo
+        echo "Recarregando daemon systemd conforme sugerido pelo sistema..."
+        sudo systemctl daemon-reload
+        
+        echo "Tentando montagem novamente após reload..."
+        sudo mount -t gfs2 -o lockproto=lock_dlm,sync "$DEVICE" "$MOUNT_POINT" || {
+            echo "Falha persistente. Possíveis causas:"
+            echo "- Serviços DLM não funcionando adequadamente"
+            echo "- Problemas de conectividade entre nós do cluster"
+            echo "- Fencing (STONITH) não configurado adequadamente"
+            error_exit "Falha na montagem por motivos não relacionados a nomes do cluster"
+        }
     fi
 }
+
+echo "✔ Montagem GFS2 realizada com sucesso"
 
 # Configurar entrada no fstab
 if grep -qs "$MOUNT_POINT" /etc/fstab; then
@@ -396,12 +463,16 @@ cat << EOF
 - Device formatado e montado com sucesso
 - Entrada no /etc/fstab configurada
 - Permissões adequadas aplicadas
+- Daemon systemd recarregado
 
 ⚠️ PRÓXIMOS PASSOS:
 - Execute este script no SEGUNDO NÓ usando o MESMO nome de cluster ($CLUSTER_NAME)
 - Realize testes de sincronização entre os nós
 - Execute test-lun-gfs2.sh para validação completa
 - Para produção: substitua STONITH dummy por fencing real
+
+💡 COMANDO PARA TESTE RÁPIDO:
+echo "teste-$(hostname)-\$(date)" | sudo tee $MOUNT_POINT/teste-sincronizacao.txt
 
 EOF
 
