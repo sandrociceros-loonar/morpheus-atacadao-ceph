@@ -36,7 +36,7 @@
 # - Devices diretos (/dev/sd*)
 # - Ambientes físicos e virtualizados (Proxmox, VMware, etc.)
 #
-# VERSÃO: 2.2 - Corrigido para compatibilidade total Ubuntu 22.04
+# VERSÃO: 2.3 - Melhorada limpeza de VGs existentes
 ################################################################################
 
 function error_exit {
@@ -241,7 +241,7 @@ for clustsvc in corosync pacemaker; do
     fi
 done
 
-# === Configuração automática de Volume LVM Compartilhado (Corrigida para Ubuntu 22.04) ===
+# === Configuração automática de Volume LVM Compartilhado (Melhorada) ===
 echo "Verificando e configurando Volumes Lógicos LVM para compartilhar a LUN..."
 
 # Verificar se já existe volume compartilhado
@@ -316,32 +316,77 @@ else
     if [[ "$CREATE_LVM" == "s" || "$CREATE_LVM" == "y" ]]; then
         echo "Criando Volume Group compartilhado..."
         
-        # Verificar se o device não está sendo usado
-        if sudo pvdisplay "$SELECTED_DEVICE" &>/dev/null; then
-            echo "⚠️ Device $SELECTED_DEVICE já está sendo usado pelo LVM."
-            read -p "Deseja remover uso anterior e recriar? [s/N]: " RECREATE
-            RECREATE=${RECREATE,,}
-            if [[ "$RECREATE" == "s" || "$RECREATE" == "y" ]]; then
-                # Remover configuração anterior de forma segura
-                VG_NAME=$(sudo pvdisplay "$SELECTED_DEVICE" 2>/dev/null | grep "VG Name" | awk '{print $3}')
-                if [ -n "$VG_NAME" ]; then
-                    sudo vgremove -f "$VG_NAME" 2>/dev/null || true
-                fi
+        # === SEÇÃO MELHORADA: Limpeza robusta de VGs existentes ===
+        
+        # Verificar se VG 'vg_cluster' já existe
+        if sudo vgdisplay vg_cluster &>/dev/null; then
+            echo "⚠️ Volume Group 'vg_cluster' já existe no sistema."
+            read -p "Deseja remover completamente e recriar? [s/N]: " RECREATE_VG
+            RECREATE_VG=${RECREATE_VG,,}
+            if [[ "$RECREATE_VG" == "s" || "$RECREATE_VG" == "y" ]]; then
+                echo "Removendo VG anterior completamente..."
+                
+                # 1. Desativar todos os LVs do VG
+                echo "Desativando Logical Volumes..."
+                sudo lvchange -an vg_cluster 2>/dev/null || true
+                
+                # 2. Remover todos os LVs do VG
+                echo "Removendo Logical Volumes..."
+                for lv in $(sudo lvs --noheadings -o lv_name vg_cluster 2>/dev/null | tr -d ' '); do
+                    sudo lvremove -f vg_cluster/$lv 2>/dev/null || true
+                done
+                
+                # 3. Remover VG forçadamente
+                echo "Removendo Volume Group..."
+                sudo vgremove -f vg_cluster 2>/dev/null || true
+                
+                # 4. Remover Physical Volume
+                echo "Removendo Physical Volume..."
                 sudo pvremove -f "$SELECTED_DEVICE" 2>/dev/null || true
+                
+                # 5. Verificar se foi removido
+                if sudo vgdisplay vg_cluster &>/dev/null; then
+                    error_exit "Falha ao remover VG 'vg_cluster' anterior. Remoção manual necessária."
+                else
+                    echo "✔ VG anterior removido completamente"
+                fi
             else
-                error_exit "Não é possível prosseguir com device em uso."
+                error_exit "Não é possível prosseguir com VG existente."
             fi
         fi
         
+        # Verificar se o device já está sendo usado por outro VG
+        if sudo pvdisplay "$SELECTED_DEVICE" &>/dev/null; then
+            echo "⚠️ Device $SELECTED_DEVICE já está sendo usado pelo LVM."
+            VG_NAME=$(sudo pvdisplay "$SELECTED_DEVICE" 2>/dev/null | grep "VG Name" | awk '{print $3}' | tr -d ' ')
+            if [ -n "$VG_NAME" ]; then
+                echo "Device pertence ao VG: $VG_NAME"
+                read -p "Deseja remover uso anterior e recriar? [s/N]: " RECREATE_PV
+                RECREATE_PV=${RECREATE_PV,,}
+                if [[ "$RECREATE_PV" == "s" || "$RECREATE_PV" == "y" ]]; then
+                    echo "Removendo uso anterior do device..."
+                    sudo vgremove -f "$VG_NAME" 2>/dev/null || true
+                    sudo pvremove -f "$SELECTED_DEVICE" 2>/dev/null || true
+                else
+                    error_exit "Não é possível prosseguir com device em uso."
+                fi
+            fi
+        fi
+        
+        # === FIM DA SEÇÃO MELHORADA ===
+        
         # Criar VG compartilhado (sintaxe correta Ubuntu 22.04)
+        echo "Criando novo Volume Group..."
         sudo vgcreate --shared vg_cluster "$SELECTED_DEVICE" || error_exit "Falha ao criar VG compartilhado"
         echo "✔ Volume Group 'vg_cluster' criado com sucesso"
         
         # Criar LV usando TODO o espaço disponível (sintaxe correta Ubuntu 22.04)
+        echo "Criando Logical Volume..."
         sudo lvcreate -n lv_gfs2 -l 100%FREE vg_cluster || error_exit "Falha ao criar LV"
         echo "✔ Logical Volume 'lv_gfs2' criado usando todo o espaço disponível"
         
         # Ativar LV (sintaxe correta Ubuntu 22.04)
+        echo "Ativando Logical Volume..."
         sudo lvchange -ay /dev/vg_cluster/lv_gfs2 || error_exit "Falha ao ativar LV"
         echo "✔ Logical Volume ativado com sucesso"
         
