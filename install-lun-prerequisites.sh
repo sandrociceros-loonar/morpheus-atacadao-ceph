@@ -19,7 +19,18 @@ function check_service_enabled {
 
 echo "==== Preparando ambiente Ubuntu para LUN GFS2 compartilhada em cluster ===="
 
-PKGS=(gfs2-utils corosync dlm lvmlockd pcs lvm2 multipath-tools)
+# Detectar versão do Ubuntu
+ubuntu_version=$(lsb_release -rs)
+
+# Ajustar nomes dos pacotes conforme a versão do Ubuntu
+if [[ "$ubuntu_version" == "22.04" ]]; then
+    PKGS=(gfs2-utils corosync dlm lvmlockd pcs lvm2 multipath-tools)
+elif [[ "$ubuntu_version" == "24.04" ]]; then
+    PKGS=(gfs2-utils corosync dlm lvm2-lockd pcs lvm2 multipath-tools)
+else
+    error_exit "Versão do Ubuntu não suportada: $ubuntu_version"
+fi
+
 MISSING=()
 
 echo "Checando pacotes necessários..."
