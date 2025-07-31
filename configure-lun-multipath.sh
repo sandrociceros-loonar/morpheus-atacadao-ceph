@@ -294,12 +294,6 @@ fi
 echo "Limpando assinaturas existentes do device..."
 sudo wipefs -a "$DEVICE" 2>/dev/null || true
 
-# Verificar se device tem conflitos de GFS2 anterior
-if sudo file -s "$DEVICE" | grep -q gfs2; then
-    echo "⚠️ Device contém filesystem GFS2 anterior."
-    echo "Para garantir compatibilidade, será realizada limpeza completa."
-fi
-
 echo "O device $DEVICE será formatado como GFS2 e montado em $MOUNT_POINT."
 echo "Nome do cluster: $CLUSTER_NAME"
 echo "Nome do volume: $VOLUME_NAME"
@@ -311,16 +305,45 @@ if [[ "$CONFIRM" != "s" && "$CONFIRM" != "y" ]]; then
     exit 0
 fi
 
-# === Formatação e Montagem ===
+# === Formatação e Montagem (Seção Corrigida) ===
 echo "Formatando $DEVICE como GFS2 com identificador $CLUSTER_NAME:$VOLUME_NAME..."
-sudo mkfs.gfs2 -j2 -p lock_dlm -t "$CLUSTER_NAME:$VOLUME_NAME" "$DEVICE" -f
+
+# Verificar se device já tem conteúdo
+if sudo file -s "$DEVICE" | grep -q filesystem; then
+    echo "⚠️ Device contém dados existentes. Formatação irá apagar todo o conteúdo."
+    echo "Prosseguindo com formatação automática..."
+fi
+
+# Formatação GFS2 (sem opção -f que não existe)
+echo "Iniciando formatação GFS2..."
+echo "y" | sudo mkfs.gfs2 -j2 -p lock_dlm -t "$CLUSTER_NAME:$VOLUME_NAME" "$DEVICE"
 MKFS_RC=$?
 
 if [ $MKFS_RC -ne 0 ]; then
-    echo "Falha na formatação. Tentando limpeza forçada..."
-    sudo dd if=/dev/zero of="$DEVICE" bs=1M count=10 status=progress
-    sudo mkfs.gfs2 -j2 -p lock_dlm -t "$CLUSTER_NAME:$VOLUME_NAME" "$DEVICE" -f || error_exit "Falha definitiva na formatação"
+    echo "Falha na formatação inicial. Realizando limpeza completa do device..."
+    
+    # Limpeza mais agressiva
+    echo "Limpando primeiros 50MB do device..."
+    sudo dd if=/dev/zero of="$DEVICE" bs=1M count=50 status=progress
+    
+    # Remover todas as assinaturas
+    echo "Removendo assinaturas de filesystem..."
+    sudo wipefs -a "$DEVICE"
+    
+    # Aguardar sincronização
+    sync
+    sleep 2
+    
+    # Segunda tentativa de formatação
+    echo "Tentando formatação após limpeza completa..."
+    echo "y" | sudo mkfs.gfs2 -j2 -p lock_dlm -t "$CLUSTER_NAME:$VOLUME_NAME" "$DEVICE"
+    
+    if [ $? -ne 0 ]; then
+        error_exit "Falha definitiva na formatação GFS2. Verifique se o device está livre e acessível."
+    fi
 fi
+
+echo "✔ Formatação GFS2 concluída com sucesso"
 
 if [ ! -d "$MOUNT_POINT" ]; then
     sudo mkdir -p "$MOUNT_POINT" || error_exit "Falha ao criar diretório $MOUNT_POINT"
@@ -336,6 +359,7 @@ sudo mount -t gfs2 -o lockproto=lock_dlm,sync "$DEVICE" "$MOUNT_POINT" || {
         echo "Filesystem: $CLUSTER_NAME | Cluster ativo: $CURRENT_CLUSTER_NAME"
         echo "Corrigindo nome no filesystem..."
         sudo tunegfs2 -T "$CURRENT_CLUSTER_NAME:$VOLUME_NAME" "$DEVICE"
+        CLUSTER_NAME="$CURRENT_CLUSTER_NAME"  # Atualizar variável para saída final
         sudo mount -t gfs2 -o lockproto=lock_dlm,sync "$DEVICE" "$MOUNT_POINT" || error_exit "Falha persistente na montagem"
     else
         error_exit "Falha ao montar $DEVICE em $MOUNT_POINT"
