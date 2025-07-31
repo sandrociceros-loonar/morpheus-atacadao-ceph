@@ -14,10 +14,9 @@ if [ -z "$STONITH_OK" ]; then
     read -p "Deseja criar um STONITH dummy (apenas para LAB/teste)? [s/N]: " ADDSTONITH
     ADDSTONITH=$(echo "${ADDSTONITH:-n}" | tr '[:upper:]' '[:lower:]')
     if [[ "$ADDSTONITH" == "s" || "$ADDSTONITH" == "y" ]]; then
-        # Tenta listar automaticamente os nós presentes
         NODELIST=$(sudo pcs status nodes 2>/dev/null | grep -oE "[a-zA-Z0-9._-]+" | grep -v "Online" | tr '\n' ',' | sed 's/,$//')
         if [ -z "$NODELIST" ]; then
-            read -p "Informe a lista de nós separada por vírgula (ex: srvmvm001a,srvmvm001b): " NODELIST
+            read -p "Informe a lista de nós separada por vírgula (ex: fc-test1,fc-test2): " NODELIST
             NODELIST=${NODELIST// /}
         fi
         sudo pcs stonith create my-fake-fence fence_dummy pcmk_host_list="${NODELIST}"
@@ -28,27 +27,89 @@ if [ -z "$STONITH_OK" ]; then
     fi
 fi
 
-# === Fluxo normal do script ===
+# === Detecção Melhorada de Devices (LVM + Multipath Direto) ===
 
-MULTIPATHS=($(ls /dev/mapper/ | grep -E '^[0-9a-fA-F]{32,}$|mpath[0-9]+|mpath[a-z]+' | awk '{print "/dev/mapper/"$1}'))
+AVAILABLE_DEVICES=()
 
-if [ ${#MULTIPATHS[@]} -eq 0 ]; then
-    error_exit "Nenhum device multipath encontrado em /dev/mapper/"
-fi
+echo "Detectando devices disponíveis para GFS2..."
 
-echo "Dispositivos multipath detectados no sistema:"
-for i in "${!MULTIPATHS[@]}"; do
-    SIZE=$(lsblk -bdno SIZE "${MULTIPATHS[$i]}")
-    SIZE_H=$(numfmt --to=iec $SIZE)
-    echo "$((i+1)). ${MULTIPATHS[$i]} - Tamanho: $SIZE_H"
+# 1. Procurar devices LVM compartilhados primeiro
+echo "Procurando volumes LVM compartilhados..."
+LVM_DEVICES=$(sudo lvs -a -o lv_path,lv_attr --noheadings 2>/dev/null | grep "w.*a" | awk '{print $1}' | tr -d ' ')
+for lvm_dev in $LVM_DEVICES; do
+    if [ -e "$lvm_dev" ]; then
+        AVAILABLE_DEVICES+=("$lvm_dev")
+        echo "  Encontrado LVM: $lvm_dev"
+    fi
 done
 
-read -p "Digite o número do device multipath que deseja utilizar: " SELECAO
+# 2. Procurar devices multipath diretos
+echo "Procurando devices multipath diretos..."
+# Padrão expandido para capturar fc-lun-*, mpath*, e devices com IDs
+MULTIPATH_PATTERNS=(
+    "fc-lun-*"           # fc-lun-cluster, fc-lun-storage, etc.
+    "mpath[0-9]*"        # mpath0, mpath1, etc.
+    "mpath[a-zA-Z]*"     # mpatha, mpathb, etc.
+    "[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]*" # IDs hexadecimais
+)
+
+for pattern in "${MULTIPATH_PATTERNS[@]}"; do
+    for device in /dev/mapper/$pattern; do
+        if [ -e "$device" ] && [ "$device" != "/dev/mapper/control" ]; then
+            # Verificar se não é LVM (evitar duplicatas)
+            if ! sudo lvdisplay "$device" &>/dev/null; then
+                AVAILABLE_DEVICES+=("$device")
+                echo "  Encontrado Multipath: $device"
+            fi
+        fi
+    done
+done
+
+# 3. Fallback para devices diretos (sdb, sdc, etc.) se nenhum multipath foi encontrado
+if [ ${#AVAILABLE_DEVICES[@]} -eq 0 ]; then
+    echo "Procurando devices diretos como fallback..."
+    for device in /dev/sd[b-z]; do
+        if [ -e "$device" ]; then
+            AVAILABLE_DEVICES+=("$device")
+            echo "  Encontrado device direto: $device"
+        fi
+    done
+fi
+
+# Verificar se encontrou algum device
+if [ ${#AVAILABLE_DEVICES[@]} -eq 0 ]; then
+    error_exit "Nenhum device disponível encontrado para configurar GFS2"
+fi
+
+# === Exibir lista de devices disponíveis ===
+echo
+echo "Devices disponíveis para configuração GFS2:"
+for i in "${!AVAILABLE_DEVICES[@]}"; do
+    DEVICE=${AVAILABLE_DEVICES[$i]}
+    SIZE=$(lsblk -bdno SIZE "$DEVICE" 2>/dev/null)
+    if [ -n "$SIZE" ]; then
+        SIZE_H=$(numfmt --to=iec $SIZE)
+        
+        # Identificar o tipo do device
+        DEVICE_TYPE="Direto"
+        if [[ "$DEVICE" =~ ^/dev/vg_ ]] || sudo lvdisplay "$DEVICE" &>/dev/null; then
+            DEVICE_TYPE="LVM"
+        elif [[ "$DEVICE" =~ ^/dev/mapper/ ]]; then
+            DEVICE_TYPE="Multipath"
+        fi
+        
+        echo "$((i+1)). $DEVICE - Tamanho: $SIZE_H - Tipo: $DEVICE_TYPE"
+    else
+        echo "$((i+1)). $DEVICE - (tamanho não detectado)"
+    fi
+done
+
+read -p "Digite o número do device que deseja utilizar: " SELECAO
 INDEX=$((SELECAO-1))
-if ! [[ "$SELECAO" =~ ^[0-9]+$ ]] || [ "$INDEX" -lt 0 ] || [ "$INDEX" -ge ${#MULTIPATHS[@]} ]; then
+if ! [[ "$SELECAO" =~ ^[0-9]+$ ]] || [ "$INDEX" -lt 0 ] || [ "$INDEX" -ge ${#AVAILABLE_DEVICES[@]} ]; then
     error_exit "Seleção inválida."
 fi
-DEVICE=${MULTIPATHS[$INDEX]}
+DEVICE=${AVAILABLE_DEVICES[$INDEX]}
 echo "Você selecionou: $DEVICE"
 
 DEFAULT_MOUNT="/mnt/gfs2"
@@ -149,12 +210,18 @@ cat << EOF
 ---
 [✔] Configuração concluída!
 
+✔ DEVICE CONFIGURADO:
+- Device utilizado: $DEVICE
+- Sistema de arquivos: GFS2
+- Ponto de montagem: $MOUNT_POINT
+- Lockproto: lock_dlm (cluster)
+
 ⚠️ RECOMENDAÇÕES FUTURAS:
 - Certifique-se de que os serviços do cluster (corosync, pacemaker) estão ativos e funcionais em ambos os nós.
-- Verifique se o volume lógico LVM está criado, marcado com --shared e ativado em ambos os nós.
 - Garanta que o nome do cluster (exemplo: meucluster:gfs2vol) usado no mkfs.gfs2 seja o mesmo em todos os nós.
 - Configure STONITH (fencing) válido para produção! Esse dummy serve apenas para LAB.
 - Realize testes de leitura/escrita em ambos os nós para validar a sincronização.
+- Execute o script test-lun-gfs2.sh para validar o funcionamento completo.
 ---
 
 EOF
