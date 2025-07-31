@@ -1,5 +1,43 @@
 #!/bin/bash
 
+################################################################################
+# Script: install-lun-prerequisites.sh
+# Descrição: Preparação completa de ambiente Ubuntu 22.04 para cluster GFS2
+#
+# FUNCIONALIDADES PRINCIPAIS:
+# - Instala pacotes essenciais para cluster GFS2 (gfs2-utils, corosync, pacemaker, etc.)
+# - Configura serviços de cluster (multipathd, dlm_controld, lvmlockd)
+# - Cria unit files systemd personalizados para dlm_controld e lvmlockd (Ubuntu 22.04)
+# - Ajusta configuração LVM para uso em cluster (/etc/lvm/lvm.conf)
+# - Detecta automaticamente devices disponíveis (multipath ou diretos)
+# - Cria Volume Group e Logical Volume compartilhado com tamanho otimizado
+# - Configura usuário/grupo para permissões adequadas
+# - Valida configuração de hostname único para cluster
+#
+# PRÉ-REQUISITOS:
+# - Ubuntu 22.04 LTS
+# - Acesso sudo
+# - Device de storage compartilhado disponível (LUN iSCSI, multipath, etc.)
+# - Conectividade de rede entre nós do cluster
+#
+# USO:
+# 1. Execute em AMBOS os nós do cluster
+# 2. Siga os prompts interativos
+# 3. Após sucesso, execute configure-lun-multipath.sh
+#
+# SAÍDA ESPERADA:
+# - Todos os serviços essenciais ativos
+# - Volume LVM compartilhado criado (/dev/vg_cluster/lv_gfs2)
+# - Sistema pronto para configuração GFS2
+#
+# COMPATIBILIDADE:
+# - Ubuntu 22.04 (adaptado para ausência de unit files systemd padrão)
+# - Multipath devices (/dev/mapper/*)
+# - Devices diretos (/dev/sd*)
+# - Ambientes físicos e virtualizados (Proxmox, VMware, etc.)
+#
+################################################################################
+
 function error_exit {
     echo "Erro: $1"
     exit 1
@@ -183,24 +221,125 @@ for clustsvc in corosync pacemaker; do
     fi
 done
 
-# Verificar volume LVM compartilhado
-echo "Verificando Volumes Lógicos do LVM para compartilhar a LUN..."
-echo "Listando VG e LVs com atributo compartilhado (wz--s):"
+# === NOVA SEÇÃO: Configuração automática de Volume LVM Compartilhado ===
+echo "Verificando e configurando Volumes Lógicos LVM para compartilhar a LUN..."
+
+# Verificar se já existe volume compartilhado
 lvs_sharing=$(sudo lvs -a -o vg_name,lv_name,lv_attr --noheadings 2>/dev/null | grep wz--s)
 
-if [ -z "$lvs_sharing" ]; then
-    echo "Nenhum volume lógico ativado com opção --shared encontrado."
-    echo "É necessário criar e ativar o VG/LV com --shared para uso em cluster."
-    echo "Exemplo: sudo vgcreate --shared vg_cluster /dev/sdX"
-    echo "sudo lvcreate --shared -n lv_gfs2 -L tamanho vg_cluster"
-    read -p "Deseja continuar mesmo assim? [s/N]: " r
-    r=${r,,}
-    if [[ $r != "s" && $r != "y" ]]; then
-        error_exit "Volume compartilhado necessário ausente. Abortando."
-    fi
-else
-    echo "Volumes com --shared ativados encontrados:"
+if [ -n "$lvs_sharing" ]; then
+    echo "✔ Volumes LVM compartilhados já existem:"
     echo "$lvs_sharing"
+else
+    echo "⚠️ Nenhum volume lógico compartilhado encontrado."
+    
+    # Detectar devices disponíveis (multipath ou direto)
+    CANDIDATE_DEVICES=()
+    
+    # Procurar devices multipath primeiro
+    if ls /dev/mapper/fc-lun-* &>/dev/null; then
+        CANDIDATE_DEVICES+=($(ls /dev/mapper/fc-lun-*))
+    fi
+    
+    # Procurar other multipath devices
+    if ls /dev/mapper/[0-9a-fA-F]* &>/dev/null; then
+        CANDIDATE_DEVICES+=($(ls /dev/mapper/[0-9a-fA-F]* | grep -v control))
+    fi
+    
+    # Fallback para devices diretos (sdb, sdc, etc - excluindo sda que geralmente é SO)
+    if [ ${#CANDIDATE_DEVICES[@]} -eq 0 ]; then
+        CANDIDATE_DEVICES+=($(ls /dev/sd[b-z] 2>/dev/null | head -5))
+    fi
+    
+    if [ ${#CANDIDATE_DEVICES[@]} -eq 0 ]; then
+        echo "❌ Nenhum device candidato encontrado para criar VG compartilhado."
+        error_exit "Device para LUN compartilhada não encontrado."
+    fi
+    
+    echo "Devices candidatos detectados:"
+    for i in "${!CANDIDATE_DEVICES[@]}"; do
+        DEVICE=${CANDIDATE_DEVICES[$i]}
+        SIZE=$(lsblk -bdno SIZE "$DEVICE" 2>/dev/null)
+        if [ -n "$SIZE" ]; then
+            SIZE_H=$(numfmt --to=iec $SIZE)
+            echo "$((i+1)). $DEVICE - Tamanho: $SIZE_H"
+        else
+            echo "$((i+1)). $DEVICE - (tamanho não detectado)"
+        fi
+    done
+    
+    read -p "Selecione o device para criar VG compartilhado (número): " DEVICE_NUM
+    DEVICE_INDEX=$((DEVICE_NUM-1))
+    
+    if [ "$DEVICE_INDEX" -lt 0 ] || [ "$DEVICE_INDEX" -ge ${#CANDIDATE_DEVICES[@]} ]; then
+        error_exit "Seleção inválida."
+    fi
+    
+    SELECTED_DEVICE=${CANDIDATE_DEVICES[$DEVICE_INDEX]}
+    echo "Device selecionado: $SELECTED_DEVICE"
+    
+    # Obter tamanho disponível do device
+    TOTAL_SIZE_BYTES=$(lsblk -bdno SIZE "$SELECTED_DEVICE")
+    if [ -z "$TOTAL_SIZE_BYTES" ]; then
+        error_exit "Não foi possível determinar o tamanho do device $SELECTED_DEVICE"
+    fi
+    
+    # Calcular tamanho em GB (deixando margem de segurança de ~5%)
+    TOTAL_SIZE_GB=$((TOTAL_SIZE_BYTES / 1024 / 1024 / 1024))
+    USABLE_SIZE_GB=$((TOTAL_SIZE_GB * 95 / 100))
+    
+    # Mínimo de 1GB
+    if [ "$USABLE_SIZE_GB" -lt 1 ]; then
+        USABLE_SIZE_GB=1
+    fi
+    
+    echo "Tamanho total do device: ${TOTAL_SIZE_GB}GB"
+    echo "Tamanho utilizável (95%): ${USABLE_SIZE_GB}GB"
+    
+    read -p "Criar VG 'vg_cluster' e LV 'lv_gfs2' de ${USABLE_SIZE_GB}GB no device $SELECTED_DEVICE? [s/N]: " CREATE_LVM
+    CREATE_LVM=${CREATE_LVM,,}
+    
+    if [[ "$CREATE_LVM" == "s" || "$CREATE_LVM" == "y" ]]; then
+        echo "Criando Volume Group compartilhado..."
+        
+        # Verificar se o device não está sendo usado
+        if sudo pvdisplay "$SELECTED_DEVICE" &>/dev/null; then
+            echo "⚠️ Device $SELECTED_DEVICE já está sendo usado pelo LVM."
+            read -p "Deseja remover uso anterior e recriar? [s/N]: " RECREATE
+            RECREATE=${RECREATE,,}
+            if [[ "$RECREATE" == "s" || "$RECREATE" == "y" ]]; then
+                # Remover configuração anterior de forma segura
+                sudo vgremove -f $(sudo pvdisplay "$SELECTED_DEVICE" | grep "VG Name" | awk '{print $3}') 2>/dev/null || true
+                sudo pvremove -f "$SELECTED_DEVICE" 2>/dev/null || true
+            else
+                error_exit "Não é possível prosseguir com device em uso."
+            fi
+        fi
+        
+        # Criar VG compartilhado
+        sudo vgcreate --shared vg_cluster "$SELECTED_DEVICE" || error_exit "Falha ao criar VG compartilhado"
+        echo "✔ Volume Group 'vg_cluster' criado com sucesso"
+        
+        # Criar LV compartilhado
+        sudo lvcreate --shared -n lv_gfs2 -L "${USABLE_SIZE_GB}G" vg_cluster || error_exit "Falha ao criar LV compartilhado"
+        echo "✔ Logical Volume 'lv_gfs2' criado com ${USABLE_SIZE_GB}GB"
+        
+        # Ativar LV em modo compartilhado
+        sudo lvchange --activate sy /dev/vg_cluster/lv_gfs2 || error_exit "Falha ao ativar LV compartilhado"
+        echo "✔ Logical Volume ativado em modo compartilhado"
+        
+        # Verificar criação
+        echo "Verificando volumes compartilhados criados:"
+        sudo lvs -a -o vg_name,lv_name,lv_attr,lv_size --noheadings | grep wz--s
+        
+    else
+        echo "Criação de VG/LV compartilhado cancelada pelo usuário."
+        read -p "Deseja continuar sem volume compartilhado? [s/N]: " CONTINUE
+        CONTINUE=${CONTINUE,,}
+        if [[ "$CONTINUE" != "s" && "$CONTINUE" != "y" ]]; then
+            error_exit "Volume compartilhado é necessário para cluster GFS2."
+        fi
+    fi
 fi
 
 # Verificação de hostname único
@@ -225,18 +364,23 @@ fi
 cat << EOF
 
 ---
-[✔] Checagem concluída! O sistema está preparado para prosseguir.
+[✔] Checagem e configuração concluídas! O sistema está preparado para prosseguir.
 
-⚠️ UNIT FILES CRIADOS:
+⚠️ UNIT FILES CRIADOS (se necessário):
 - /etc/systemd/system/dlm_controld.service
 - /etc/systemd/system/lvmlockd.service
 
+✔ VOLUME LVM COMPARTILHADO:
+- Volume Group: vg_cluster
+- Logical Volume: lv_gfs2
+- Device: /dev/vg_cluster/lv_gfs2 (use este no próximo script)
+
 ⚠️ RECOMENDAÇÕES FUTURAS:
-- Configure e inicie corretamente o cluster Corosync e Pacemaker, editando /etc/corosync/corosync.conf para incluir os nós adequados.
-- Implemente STONITH (fencing) para garantir segurança do cluster e evitar corrupção.
-- Crie e ative o volume lógico LVM compartilhado com a opção --shared em ambos os nós.
-- Certifique-se de manter o hostname único e consistente nos servidores.
-- Após finalizar estas configurações manuais, prossiga com o script de configuração/montagem da LUN (ex: configure-lun-multipath.sh).
+- Execute este script no OUTRO NÓ do cluster também
+- Configure e inicie corretamente o cluster Corosync e Pacemaker
+- Implemente STONITH (fencing) para garantir segurança do cluster
+- Após configurar ambos os nós, execute configure-lun-multipath.sh
+- Use o device /dev/vg_cluster/lv_gfs2 para o sistema de arquivos GFS2
 
 EOF
 
