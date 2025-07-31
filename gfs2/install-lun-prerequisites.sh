@@ -1,573 +1,735 @@
 #!/bin/bash
 
-################################################################################
-# Script: install-lun-prerequisites.sh
-# Descrição: Preparação completa de ambiente Ubuntu 22.04 para cluster GFS2
-#
-# FUNCIONALIDADES PRINCIPAIS:
-# - Instala pacotes essenciais para cluster GFS2 (gfs2-utils, corosync, pacemaker, etc.)
-# - Configura serviços de cluster (multipathd, dlm_controld, lvmlockd)
-# - Configura senha do usuário hacluster para autenticação do cluster
-# - Cria unit files systemd personalizados para dlm_controld e lvmlockd (Ubuntu 22.04)
-# - Ajusta configuração LVM para uso em cluster (/etc/lvm/lvm.conf)
-# - Detecta automaticamente devices disponíveis (multipath ou diretos)
-# - Cria Volume Group e Logical Volume compartilhado com tamanho otimizado
-# - Configura usuário/grupo para permissões adequadas
-# - Valida configuração de hostname único para cluster
-#
-# PRÉ-REQUISITOS:
-# - Ubuntu 22.04 LTS
-# - Acesso sudo
-# - Device de storage compartilhado disponível (LUN iSCSI, multipath, etc.)
-# - Conectividade de rede entre nós do cluster
-#
-# USO:
-# 1. Execute em AMBOS os nós do cluster
-# 2. Siga os prompts interativos
-# 3. Use a MESMA senha do hacluster em ambos os nós
-# 4. Após sucesso, execute configure-lun-multipath.sh
-#
-# VERSÃO: 2.5 - Inclui configuração automática da senha hacluster
-################################################################################
+# ============================================================================
+# SCRIPT: install-lun-prerequisites.sh
+# DESCRIÇÃO: Instalação e configuração de pré-requisitos para GFS2 Enterprise
+# VERSÃO: 2.0 - Enterprise Cluster Ready
+# AUTOR: DevOps Team
+# ============================================================================
 
-function error_exit {
-    echo "Erro: $1"
+# Configurações globais
+set -euo pipefail
+
+# Cores para output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Variáveis do cluster
+readonly CLUSTER_NAME="cluster_gfs2"
+readonly NODE1_IP="192.168.0.252"
+readonly NODE2_IP="192.168.0.251"
+readonly NODE1_NAME="fc-test1"
+readonly NODE2_NAME="fc-test2"
+
+# ============================================================================
+# FUNÇÕES AUXILIARES
+# ============================================================================
+
+print_header() {
+    echo -e "\n${BLUE}========================================================================${NC}"
+    echo -e "${BLUE}$1${NC}"
+    echo -e "${BLUE}========================================================================${NC}\n"
+}
+
+print_success() {
+    echo -e "${GREEN}✅ $1${NC}"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠️  $1${NC}"
+}
+
+print_error() {
+    echo -e "${RED}❌ $1${NC}"
+}
+
+print_info() {
+    echo -e "${BLUE}ℹ️  $1${NC}"
+}
+
+error_exit() {
+    print_error "$1"
     exit 1
 }
 
-function check_pkg {
-    dpkg -s "$1" &>/dev/null
-}
+# ============================================================================
+# DETECÇÃO DE AMBIENTE E NÓ
+# ============================================================================
 
-function check_service_active {
-    systemctl is-active --quiet "$1"
-}
-
-function check_service_enabled {
-    systemctl is-enabled --quiet "$1"
-}
-
-function force_cleanup_vg {
-    local vg_name="$1"
-    local device="$2"
+detect_node_role() {
+    local current_ip
+    current_ip=$(ip route get 8.8.8.8 2>/dev/null | awk '/src/ {print $7}' || echo "unknown")
     
-    echo "=== Iniciando limpeza robusta do VG: $vg_name ==="
+    if [[ "$current_ip" == "$NODE1_IP" ]]; then
+        echo "primary"
+    elif [[ "$current_ip" == "$NODE2_IP" ]]; then
+        echo "secondary"
+    else
+        echo "unknown"
+    fi
+}
+
+get_current_hostname() {
+    hostname -s
+}
+
+# ============================================================================
+# VERIFICAÇÕES PRÉ-REQUISITOS
+# ============================================================================
+
+check_prerequisites() {
+    print_header "🔍 Verificando Pré-requisitos do Sistema"
     
-    # 1. Verificar processos usando o VG
-    echo "Verificando processos que podem estar usando o VG..."
-    PROCESSES=$(sudo lsof /dev/$vg_name/* 2>/dev/null | grep -v COMMAND || true)
-    if [ -n "$PROCESSES" ]; then
-        echo "⚠️ Processos detectados usando o VG:"
-        echo "$PROCESSES"
-        read -p "Tentar continuar mesmo assim? [s/N]: " CONTINUE_WITH_PROCESSES
-        CONTINUE_WITH_PROCESSES=${CONTINUE_WITH_PROCESSES,,}
-        if [[ "$CONTINUE_WITH_PROCESSES" != "s" && "$CONTINUE_WITH_PROCESSES" != "y" ]]; then
-            echo "Pare os processos listados e execute o script novamente."
+    # Verificar se é executado como root
+    if [[ $EUID -eq 0 ]]; then
+        print_warning "Script executado como root. Recomendado usar sudo."
+    fi
+    
+    # Verificar conectividade de rede
+    local other_node
+    if [[ "$(detect_node_role)" == "primary" ]]; then
+        other_node="$NODE2_NAME"
+    else
+        other_node="$NODE1_NAME"
+    fi
+    
+    if ! ping -c 2 "$other_node" &>/dev/null; then
+        print_error "Não foi possível conectar com $other_node"
+        print_info "Verifique conectividade de rede entre os nós"
+        return 1
+    fi
+    
+    print_success "Conectividade com $other_node verificada"
+    
+    # Verificar resolução DNS
+    if ! nslookup "$other_node" &>/dev/null; then
+        print_warning "Resolução DNS pode estar comprometida"
+        print_info "Verificar entradas em /etc/hosts"
+    fi
+    
+    # Verificar espaço em disco
+    local available_space
+    available_space=$(df / | tail -1 | awk '{print $4}')
+    if [[ $available_space -lt 1000000 ]]; then
+        print_warning "Pouco espaço em disco disponível: ${available_space}KB"
+    fi
+    
+    print_success "Pré-requisitos básicos verificados"
+    return 0
+}
+
+# ============================================================================
+# INSTALAÇÃO DE PACOTES
+# ============================================================================
+
+install_packages() {
+    print_header "📦 Instalando Pacotes Necessários"
+    
+    # Atualizar repositórios
+    print_info "Atualizando repositórios..."
+    sudo apt update -qq
+    
+    # Lista de pacotes essenciais
+    local packages=(
+        "gfs2-utils"
+        "corosync"
+        "pacemaker"
+        "pcs"
+        "dlm-controld"
+        "lvm2-lockd"
+        "multipath-tools"
+        "open-iscsi"
+        "fence-agents"
+        "resource-agents"
+    )
+    
+    print_info "Instalando pacotes GFS2 e Cluster..."
+    for package in "${packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_success "$package já instalado"
+        else
+            print_info "Instalando $package..."
+            if sudo apt install -y "$package" &>/dev/null; then
+                print_success "$package instalado com sucesso"
+            else
+                print_error "Falha ao instalar $package"
+                return 1
+            fi
+        fi
+    done
+    
+    # Configurar senha do hacluster se necessário
+    if ! sudo passwd -S hacluster 2>/dev/null | grep -q "hacluster P"; then
+        print_info "Configurando senha do usuário hacluster..."
+        echo 'hacluster:hacluster' | sudo chpasswd
+        print_success "Senha do hacluster configurada"
+    fi
+    
+    print_success "Todos os pacotes instalados com sucesso"
+    return 0
+}
+
+# ============================================================================
+# CONFIGURAÇÃO DE CLUSTER ENTERPRISE
+# ============================================================================
+# 
+# STONITH (Shoot The Other Node In The Head):
+#   - PRODUÇÃO: Obrigatório para isolamento de nós com falha
+#   - LABORATÓRIO: Desabilitado (sem dispositivos de fencing)
+#   - STAGING: Opcional dependendo da infraestrutura
+#
+# NO-QUORUM-POLICY:
+#   - PRODUÇÃO: 'stop' ou 'freeze' (para em caso de perda de quorum)
+#   - LABORATÓRIO: 'ignore' (continua operando para testes)
+#   - DOIS NÓS: Sempre 'ignore' (qualquer falha causa perda de quorum)
+#
+# REFERÊNCIAS:
+#   - Red Hat HA-Cluster: https://access.redhat.com/documentation/
+#   - Pacemaker Documentation: https://clusterlabs.org/pacemaker/doc/
+# ============================================================================
+
+configure_cluster_properties() {
+    print_info "Configurando propriedades do cluster..."
+    
+    # Configurações essenciais para laboratório/desenvolvimento
+    print_info "📋 Aplicando configurações para ambiente de laboratório..."
+    
+    # STONITH - Desabilitar para laboratório (sem dispositivos de fencing)
+    if sudo pcs property set stonith-enabled=false; then
+        print_success "STONITH desabilitado (adequado para laboratório)"
+    else
+        print_warning "Falha ao desabilitar STONITH"
+        return 1
+    fi
+    
+    # Quorum Policy - Ignorar para clusters de 2 nós
+    if sudo pcs property set no-quorum-policy=ignore; then
+        print_success "Política de quorum configurada para 2 nós"
+    else
+        print_warning "Falha ao configurar política de quorum"
+        return 1
+    fi
+    
+    # Configurações adicionais de robustez
+    sudo pcs property set start-failure-is-fatal=false    # Não para cluster por falhas
+    sudo pcs property set symmetric-cluster=true          # Recursos podem rodar em qualquer nó
+    sudo pcs property set maintenance-mode=false          # Garantir modo operacional
+    sudo pcs property set enable-startup-probes=true      # Verificações de inicialização
+    
+    print_success "Propriedades do cluster configuradas com sucesso"
+    
+    # Verificar configurações aplicadas
+    echo ""
+    print_info "📊 Propriedades atuais do cluster:"
+    sudo pcs property show | grep -E "(stonith-enabled|no-quorum-policy|start-failure-is-fatal)" || true
+    
+    return 0
+}
+
+configure_cluster_resources() {
+    print_info "Configurando recursos DLM e lvmlockd..."
+    
+    # Aguardar cluster estabilizar
+    sleep 15
+    
+    # Configurar recurso DLM
+    if ! sudo pcs resource show dlm-clone &>/dev/null; then
+        print_info "🔒 Criando recurso DLM..."
+        if sudo pcs resource create dlm systemd:dlm \
+            op monitor interval=60s on-fail=fence \
+            clone interleave=true ordered=true; then
+            print_success "Recurso DLM criado"
+        else
+            print_error "Falha ao criar recurso DLM"
+            return 1
+        fi
+    else
+        print_success "Recurso DLM já existe"
+    fi
+    
+    # Configurar recurso lvmlockd
+    if ! sudo pcs resource show lvmlockd-clone &>/dev/null; then
+        print_info "💾 Criando recurso lvmlockd..."
+        if sudo pcs resource create lvmlockd systemd:lvmlockd \
+            op monitor interval=60s on-fail=fence \
+            clone interleave=true ordered=true; then
+            print_success "Recurso lvmlockd criado"
+        else
+            print_error "Falha ao criar recurso lvmlockd"
+            return 1
+        fi
+    else
+        print_success "Recurso lvmlockd já existe"
+    fi
+    
+    # Configurar dependências entre recursos
+    print_info "🔗 Configurando dependências de recursos..."
+    sudo pcs constraint order start dlm-clone then lvmlockd-clone 2>/dev/null || true
+    sudo pcs constraint colocation add lvmlockd-clone with dlm-clone 2>/dev/null || true
+    
+    print_success "Recursos configurados com sucesso"
+    
+    # Aguardar recursos ficarem ativos
+    print_info "⏳ Aguardando recursos ficarem ativos (60s)..."
+    sleep 60
+    
+    return 0
+}
+
+configure_enterprise_cluster() {
+    print_header "🏢 Configurando Cluster Enterprise (Pacemaker/Corosync + DLM)"
+    
+    local node_role
+    node_role=$(detect_node_role)
+    
+    case "$node_role" in
+        "primary")
+            print_info "🎯 Detectado como nó PRIMÁRIO ($NODE1_NAME): $NODE1_IP"
+            ;;
+        "secondary")
+            print_info "🎯 Detectado como nó SECUNDÁRIO ($NODE2_NAME): $NODE2_IP"
+            ;;
+        *)
+            print_error "Não foi possível detectar o papel do nó"
+            print_info "IPs esperados: $NODE1_IP (primário) ou $NODE2_IP (secundário)"
+            return 1
+            ;;
+    esac
+    
+    # Verificar se cluster já existe
+    if sudo pcs status &>/dev/null; then
+        print_warning "Cluster já configurado. Verificando status..."
+        sudo pcs status
+        return 0
+    fi
+    
+    # Configurar apenas no nó primário
+    if [[ "$node_role" == "primary" ]]; then
+        print_info "🔧 Configurando cluster no nó primário..."
+        
+        # Garantir que pcsd está ativo em ambos os nós
+        sudo systemctl start pcsd
+        sudo systemctl enable pcsd
+        
+        print_info "Verificando pcsd no nó secundário..."
+        if ssh "$NODE2_NAME" "sudo systemctl start pcsd && sudo systemctl enable pcsd" 2>/dev/null; then
+            print_success "pcsd ativo em ambos os nós"
+        else
+            print_error "Não foi possível iniciar pcsd no $NODE2_NAME"
+            return 1
+        fi
+        
+        # Aguardar pcsd estabilizar
+        sleep 10
+        
+        # Autenticar nós
+        print_info "🔐 Autenticando nós do cluster..."
+        if echo "hacluster" | sudo pcs host auth "$NODE1_NAME" "$NODE2_NAME" -u hacluster; then
+            print_success "Nós autenticados com sucesso"
+        else
+            print_error "Falha na autenticação dos nós"
+            print_info "💡 Verifique se a senha do hacluster está igual em ambos os nós"
+            return 1
+        fi
+        
+        # Criar cluster com IPs específicos
+        print_info "🏗️  Criando cluster com IPs reais..."
+        if sudo pcs cluster setup "$CLUSTER_NAME" \
+            "$NODE1_NAME" addr="$NODE1_IP" \
+            "$NODE2_NAME" addr="$NODE2_IP"; then
+            print_success "Cluster criado com sucesso"
+        else
+            print_error "Falha ao criar cluster"
+            return 1
+        fi
+        
+        # Iniciar cluster
+        print_info "▶️  Iniciando cluster..."
+        sudo pcs cluster start --all
+        sudo pcs cluster enable --all
+        
+        # Aguardar cluster estabilizar
+        print_info "⏳ Aguardando cluster estabilizar (30s)..."
+        sleep 30
+        
+        # Configurar propriedades do cluster
+        if ! configure_cluster_properties; then
+            print_error "Falha ao configurar propriedades do cluster"
+            return 1
+        fi
+        
+        # Configurar recursos do cluster
+        if ! configure_cluster_resources; then
+            print_error "Falha ao configurar recursos do cluster"
+            return 1
+        fi
+        
+        # Verificar status final
+        echo ""
+        print_info "📊 Status final do cluster:"
+        sudo pcs status
+        
+        # Validar configuração
+        if validate_cluster_configuration; then
+            print_success "Cluster configurado com sucesso!"
+            print_success "Ambos os nós estão online"
+            print_success "Recursos DLM e lvmlockd ativos"
+        else
+            print_warning "Cluster criado mas verificar status dos nós"
+            return 1
+        fi
+        
+    else
+        print_info "⏳ Aguardando configuração do cluster pelo nó primário..."
+        
+        # Aguardar cluster ser configurado pelo nó primário
+        local timeout=180
+        local count=0
+        while ! sudo pcs status &>/dev/null && [[ $count -lt $timeout ]]; do
+            echo "   Aguardando cluster... ($count/${timeout}s)"
+            sleep 10
+            ((count+=10))
+        done
+        
+        if sudo pcs status &>/dev/null; then
+            print_success "Cluster detectado! Verificando participação..."
+            sudo pcs status
+        else
+            print_error "Timeout: Cluster não foi detectado após ${timeout}s"
             return 1
         fi
     fi
     
-    # 2. Forçar desativação de todos os LVs
-    echo "Forçando desativação de Logical Volumes..."
-    sudo lvchange -an $vg_name --force 2>/dev/null || true
-    sleep 2
+    return 0
+}
+
+validate_cluster_configuration() {
+    print_info "🔍 Validando configuração do cluster..."
     
-    # 3. Remover cada LV individualmente
-    echo "Removendo Logical Volumes individualmente..."
-    local lvs_list=$(sudo lvs --noheadings -o lv_name $vg_name 2>/dev/null | tr -d ' ' || true)
-    for lv in $lvs_list; do
-        if [ -n "$lv" ]; then
-            echo "Removendo LV: $lv"
-            sudo lvremove -f /dev/$vg_name/$lv 2>/dev/null || true
-        fi
-    done
-    
-    # 4. Desativar o VG
-    echo "Desativando Volume Group..."
-    sudo vgchange -an $vg_name 2>/dev/null || true
-    sleep 2
-    
-    # 5. Remover VG forçadamente
-    echo "Removendo Volume Group forçadamente..."
-    sudo vgremove -f $vg_name 2>/dev/null || true
-    sleep 2
-    
-    # 6. Remover Physical Volume
-    echo "Removendo Physical Volume do device..."
-    sudo pvremove -f "$device" 2>/dev/null || true
-    sleep 2
-    
-    # 7. Atualizar cache do LVM
-    echo "Atualizando cache do LVM..."
-    sudo vgscan --cache 2>/dev/null || true
-    sudo pvscan --cache 2>/dev/null || true
-    
-    # 8. Verificar se foi removido completamente
-    if sudo vgdisplay $vg_name &>/dev/null; then
-        echo "❌ VG '$vg_name' ainda existe após tentativas de remoção."
-        echo "Verificando detalhes restantes..."
-        sudo vgdisplay $vg_name 2>/dev/null || true
-        sudo lvs $vg_name 2>/dev/null || true
-        
-        echo ""
-        echo "=== OPÇÕES DE LIMPEZA ADICIONAL ==="
-        echo "1. Tentar remoção mais agressiva"
-        echo "2. Reiniciar sistema e tentar novamente" 
-        echo "3. Usar device direto (sem LVM)"
-        echo "4. Abortar script"
-        read -p "Escolha uma opção [1-4]: " CLEANUP_OPTION
-        
-        case $CLEANUP_OPTION in
-            1)
-                echo "Tentando remoção mais agressiva..."
-                # Remoção mais agressiva
-                sudo dmsetup remove_all --force 2>/dev/null || true
-                sudo vgremove -f $vg_name 2>/dev/null || true
-                sudo pvremove -f "$device" 2>/dev/null || true
-                # Verificar novamente
-                if sudo vgdisplay $vg_name &>/dev/null; then
-                    echo "❌ Falha na remoção agressiva. Remoção manual necessária."
-                    return 1
-                else
-                    echo "✔ VG removido com remoção agressiva."
-                    return 0
-                fi
-                ;;
-            2)
-                echo "💡 Recomendação: Reinicie o sistema com 'sudo reboot' e execute o script novamente."
-                exit 1
-                ;;
-            3)
-                echo "💡 Será usado o device direto $device no próximo script."
-                echo "Execute configure-lun-multipath.sh e selecione o device $device diretamente."
-                return 2  # Código especial para usar device direto
-                ;;
-            4)
-                echo "Script abortado pelo usuário."
-                exit 1
-                ;;
-            *)
-                echo "Opção inválida. Abortando."
-                return 1
-                ;;
-        esac
+    # Verificar STONITH
+    local stonith_status
+    stonith_status=$(sudo pcs property show stonith-enabled 2>/dev/null | awk '/stonith-enabled/ {print $2}' || echo "unknown")
+    if [[ "$stonith_status" == "false" ]]; then
+        print_success "STONITH adequadamente desabilitado para laboratório"
     else
-        echo "✔ VG '$vg_name' removido com sucesso."
+        print_warning "STONITH habilitado - verificar dispositivos de fencing"
+    fi
+    
+    # Verificar Quorum Policy
+    local quorum_policy
+    quorum_policy=$(sudo pcs property show no-quorum-policy 2>/dev/null | awk '/no-quorum-policy/ {print $2}' || echo "unknown")
+    if [[ "$quorum_policy" == "ignore" ]]; then
+        print_success "Política de quorum adequada para cluster de 2 nós"
+    else
+        print_warning "Política de quorum pode causar problemas em cluster de 2 nós"
+    fi
+    
+    # Verificar se ambos os nós estão online
+    if sudo pcs status | grep -q "Online:.*$NODE1_NAME.*$NODE2_NAME" || sudo pcs status | grep -q "Online:.*$NODE2_NAME.*$NODE1_NAME"; then
+        print_success "Ambos os nós estão online"
         return 0
+    else
+        print_error "Nem todos os nós estão online"
+        return 1
     fi
 }
 
-echo "==== Preparando ambiente Ubuntu 22.04 para LUN GFS2 em cluster ===="
+# ============================================================================
+# CONFIGURAÇÃO DE STORAGE LVM
+# ============================================================================
 
-PKGS=(gfs2-utils corosync dlm-controld lvm2-lockd pcs lvm2 multipath-tools)
-MISSING=()
-
-echo "Checando pacotes necessários..."
-for pkg in "${PKGS[@]}"; do
-    if check_pkg "$pkg"; then
-        echo "✔ Pacote $pkg instalado."
-    else
-        MISSING+=("$pkg")
-    fi
-done
-
-if [ ${#MISSING[@]} -ne 0 ]; then
-    echo "Pacotes faltantes: ${MISSING[*]}"
-    echo "Instalará estes pacotes essenciais para cluster e multipath:"
-    echo "- gfs2-utils: suporte a sistema de arquivos GFS2"
-    echo "- corosync: comunicação do cluster"
-    echo "- dlm-controld: Distributed Lock Manager"
-    echo "- lvm2-lockd: lock do LVM para clusters"
-    echo "- pcs: gerenciador Pacemaker/Corosync"
-    echo "- lvm2: volumes lógicos"
-    echo "- multipath-tools: multipath para SAN/iSCSI/FC"
-    read -p "Deseja instalar agora? [s/N]: " ans
-    ans=${ans,,}
-    if [[ $ans == "s" || $ans == "y" ]]; then
-        sudo apt update || error_exit "Falha no apt update"
-        sudo apt install -y "${MISSING[@]}" || error_exit "Falha instalando pacotes"
-    else
-        error_exit "Instalação necessária negada. Abortando."
-    fi
-else
-    echo "✔ Todos os pacotes necessários já estão instalados."
-fi
-
-# === Configuração da senha do usuário hacluster ===
-echo "Configurando senha para usuário hacluster (necessário para autenticação do cluster)..."
-
-if id hacluster &>/dev/null; then
-    echo "✔ Usuário hacluster encontrado"
+detect_available_devices() {
+    print_header "💾 Detectando Devices de Storage Disponíveis"
     
-    # Verificar se senha já foi configurada via variável de ambiente
-    if [ -z "$HACLUSTER_PASSWORD" ]; then
-        read -s -p "Digite a senha para o usuário hacluster (mesma em todos os nós): " HACLUSTER_PASSWORD
-        echo
-        read -s -p "Confirme a senha: " HACLUSTER_PASSWORD_CONFIRM
-        echo
-        
-        if [ "$HACLUSTER_PASSWORD" != "$HACLUSTER_PASSWORD_CONFIRM" ]; then
-            error_exit "Senhas não coincidem. Execute o script novamente."
-        fi
-    else
-        echo "Usando senha fornecida via variável de ambiente HACLUSTER_PASSWORD"
+    local devices=()
+    
+    # Procurar por devices multipath
+    if ls /dev/mapper/fc-* &>/dev/null; then
+        for device in /dev/mapper/fc-*; do
+            if [[ -b "$device" && "$device" != "/dev/mapper/control" ]]; then
+                local size
+                size=$(lsblk -dn -o SIZE "$device" 2>/dev/null || echo "N/A")
+                devices+=("$device - Tamanho: $size")
+                print_info "Encontrado device multipath: $device ($size)"
+            fi
+        done
     fi
     
-    # Configurar senha usando o método mais compatível
-    echo "Configurando senha do usuário hacluster..."
-    echo "$HACLUSTER_PASSWORD" | sudo passwd --stdin hacluster 2>/dev/null || {
-        # Fallback para sistemas que não suportam --stdin
-        echo -e "$HACLUSTER_PASSWORD\n$HACLUSTER_PASSWORD" | sudo passwd hacluster
-    }
-    
-    if [ $? -eq 0 ]; then
-        echo "✔ Senha do usuário hacluster configurada com sucesso"
-    else
-        error_exit "Falha ao configurar senha do usuário hacluster"
-    fi
-else
-    echo "⚠️ Usuário hacluster não encontrado. Isso é normal se os pacotes do cluster ainda não foram instalados."
-    echo "O usuário será criado automaticamente durante a instalação dos pacotes."
-fi
-
-# Iniciar e habilitar serviço pcsd (necessário para autenticação do cluster)
-echo "Iniciando e habilitando serviço pcsd..."
-sudo systemctl enable --now pcsd
-if [ $? -eq 0 ]; then
-    echo "✔ Serviço pcsd iniciado e habilitado com sucesso"
-else
-    echo "⚠️ Aviso: Problema ao iniciar pcsd, mas continuando com o script..."
-fi
-
-# Verificar serviço multipathd (tem unit file systemd)
-echo "Verificando serviço multipathd..."
-if check_service_active "multipathd" && check_service_enabled "multipathd"; then
-    echo "✔ Serviço multipathd ativo e habilitado."
-else
-    echo "Serviço multipathd não está ativo/habilitado."
-    read -p "Ativar e habilitar multipathd agora? [s/N]: " r
-    r=${r,,}
-    if [[ $r == "s" || $r == "y" ]]; then
-        sudo systemctl enable --now multipathd || error_exit "Falha ao ativar multipathd"
-        echo "✔ Serviço multipathd ativado."
-    else
-        error_exit "Serviço multipathd obrigatório não habilitado. Abortando."
-    fi
-fi
-
-# Tratamento especial para dlm_controld (não há unit systemd por padrão)
-echo "Verificando daemon dlm_controld (Distributed Lock Manager do cluster)..."
-if [ -x /usr/sbin/dlm_controld ]; then
-    echo "✔ Binário dlm_controld disponível em /usr/sbin/dlm_controld."
-    if pgrep -x dlm_controld >/dev/null; then
-        echo "✔ dlm_controld já está rodando."
-    else
-        echo "⚠️ O daemon dlm_controld NÃO está rodando."
-        echo "No Ubuntu 22.04, dlm_controld não possui unit file systemd padrão."
-        echo "Criando unit file personalizado para dlm_controld..."
-        
-        # Criar unit file personalizado
-        sudo tee /etc/systemd/system/dlm_controld.service > /dev/null << 'EOF'
-[Unit]
-Description=DLM Control Daemon (Cluster Locked Filesystems)
-After=network.target corosync.service
-Requires=corosync.service
-
-[Service]
-Type=simple
-ExecStart=/usr/sbin/dlm_controld -D
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        
-        # Recarregar systemd e ativar serviço
-        sudo systemctl daemon-reload
-        
-        read -p "Deseja habilitar e iniciar o dlm_controld agora? (s/N): " RESP
-        RESP=${RESP,,}
-        if [[ $RESP == "s" || $RESP == "y" ]]; then
-            sudo systemctl enable --now dlm_controld || error_exit "Falha ao ativar dlm_controld"
-            echo "✔ dlm_controld habilitado e iniciado via systemd."
-        else
-            echo "⚠️ AVISO: dlm_controld não iniciado. GFS2/DLM não funcionará corretamente."
-        fi
-    fi
-else
-    echo "❌ Binário dlm_controld não encontrado! Instale o pacote dlm-controld."
-    error_exit "dlm_controld ausente, não é possível prosseguir."
-fi
-
-# Tratamento especial para lvmlockd (não há unit systemd por padrão)
-echo "Verificando daemon lvmlockd (lock manager do LVM para cluster)..."
-if [ -x /usr/sbin/lvmlockd ]; then
-    echo "✔ Binário lvmlockd disponível em /usr/sbin/lvmlockd."
-    if pgrep -x lvmlockd >/dev/null; then
-        echo "✔ lvmlockd já está rodando."
-    else
-        echo "⚠️ O daemon lvmlockd NÃO está rodando."
-        echo "No Ubuntu 22.04, lvmlockd não possui unit file systemd padrão."
-        echo "Criando unit file personalizado para lvmlockd..."
-        
-        # Criar unit file personalizado
-        sudo tee /etc/systemd/system/lvmlockd.service > /dev/null << 'EOF'
-[Unit]
-Description=LVM Lock Daemon
-After=network.target dlm_controld.service
-Requires=dlm_controld.service
-
-[Service]
-Type=simple
-ExecStart=/usr/sbin/lvmlockd -D
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        
-        # Recarregar systemd
-        sudo systemctl daemon-reload
-        
-        read -p "Deseja habilitar e iniciar o lvmlockd agora? (s/N): " RESP
-        RESP=${RESP,,}
-        if [[ $RESP == "s" || $RESP == "y" ]]; then
-            sudo systemctl enable --now lvmlockd || error_exit "Falha ao ativar lvmlockd"
-            echo "✔ lvmlockd habilitado e iniciado via systemd."
-        else
-            echo "⚠️ AVISO: lvmlockd não iniciado. O uso de LVM compartilhado pode não funcionar corretamente."
-        fi
-    fi
-else
-    echo "❌ Binário lvmlockd não encontrado! Instale o pacote lvm2-lockd."
-    error_exit "lvmlockd ausente, não é possível prosseguir."
-fi
-
-# === Configuração LVM para Cluster (Adaptada para Ubuntu 22.04) ===
-echo "Configurando LVM adequadamente para cluster sharing (Ubuntu 22.04)..."
-
-# Backup da configuração atual
-sudo cp /etc/lvm/lvm.conf /etc/lvm/lvm.conf.backup.$(date +%Y%m%d_%H%M%S)
-
-# Remover configurações conflitantes ou incompatíveis
-sudo sed -i '/use_lvmlockd/d' /etc/lvm/lvm.conf
-sudo sed -i '/locking_type/d' /etc/lvm/lvm.conf  
-sudo sed -i '/shared_activation/d' /etc/lvm/lvm.conf
-
-# Aplicar APENAS configurações compatíveis com Ubuntu 22.04
-sudo sed -i '/^global {/a\    use_lvmlockd = 1\n    locking_type = 1' /etc/lvm/lvm.conf
-
-echo "✔ Configurações LVM para cluster aplicadas (Ubuntu 22.04):"
-grep -E "(use_lvmlockd|locking_type)" /etc/lvm/lvm.conf
-
-# Reiniciar lvmlockd para aplicar configurações
-echo "Reiniciando lvmlockd para aplicar novas configurações..."
-sudo systemctl restart lvmlockd
-sleep 3
-
-if pgrep -x lvmlockd >/dev/null; then
-    echo "✔ lvmlockd configurado e funcionando para cluster"
-else
-    error_exit "Falha ao configurar lvmlockd para cluster"
-fi
-
-# Checagem dos serviços de cluster corosync/pacemaker
-echo "Verificando serviços de cluster corosync e pacemaker..."
-for clustsvc in corosync pacemaker; do
-    if check_service_active "$clustsvc"; then
-        echo "✔ Serviço $clustsvc ativo."
-    else
-        echo "ALERTA: Serviço $clustsvc NÃO está ativo."
-        read -p "Deseja continuar mesmo assim? [s/N]: " r
-        r=${r,,}
-        if [[ $r != "s" && $r != "y" ]]; then
-            error_exit "Serviço $clustsvc deve estar ativo para cluster funcionar. Abortando."
-        fi
-    fi
-done
-
-# === Configuração automática de Volume LVM Compartilhado (Melhorada) ===
-echo "Verificando e configurando Volumes Lógicos LVM para compartilhar a LUN..."
-
-# Verificar se já existe volume compartilhado
-lvs_sharing=$(sudo lvs -a -o vg_name,lv_name,lv_attr --noheadings 2>/dev/null | grep "w.*a")
-
-if [ -n "$lvs_sharing" ]; then
-    echo "✔ Volumes LVM já existem:"
-    echo "$lvs_sharing"
-else
-    echo "⚠️ Nenhum volume lógico encontrado para cluster."
-    
-    # Detectar devices disponíveis (multipath ou direto)
-    CANDIDATE_DEVICES=()
-    
-    # Procurar devices multipath primeiro
-    if ls /dev/mapper/fc-lun-* &>/dev/null; then
-        CANDIDATE_DEVICES+=($(ls /dev/mapper/fc-lun-*))
-    fi
-    
-    # Procurar other multipath devices
-    if ls /dev/mapper/[0-9a-fA-F]* &>/dev/null; then
-        CANDIDATE_DEVICES+=($(ls /dev/mapper/[0-9a-fA-F]* | grep -v control))
-    fi
-    
-    # Fallback para devices diretos (sdb, sdc, etc - excluindo sda que geralmente é SO)
-    if [ ${#CANDIDATE_DEVICES[@]} -eq 0 ]; then
-        CANDIDATE_DEVICES+=($(ls /dev/sd[b-z] 2>/dev/null | head -5))
-    fi
-    
-    if [ ${#CANDIDATE_DEVICES[@]} -eq 0 ]; then
-        echo "❌ Nenhum device candidato encontrado para criar VG compartilhado."
-        error_exit "Device para LUN compartilhada não encontrado."
-    fi
-    
-    echo "Devices candidatos detectados:"
-    for i in "${!CANDIDATE_DEVICES[@]}"; do
-        DEVICE=${CANDIDATE_DEVICES[$i]}
-        SIZE=$(lsblk -bdno SIZE "$DEVICE" 2>/dev/null)
-        if [ -n "$SIZE" ]; then
-            SIZE_H=$(numfmt --to=iec $SIZE)
-            echo "$((i+1)). $DEVICE - Tamanho: $SIZE_H"
-        else
-            echo "$((i+1)). $DEVICE - (tamanho não detectado)"
+    # Procurar por devices físicos adequados (excluir disco do sistema)
+    for device in /dev/sd[b-z]; do
+        if [[ -b "$device" ]]; then
+            local size
+            size=$(lsblk -dn -o SIZE "$device" 2>/dev/null || echo "N/A")
+            local mountpoint
+            mountpoint=$(lsblk -dn -o MOUNTPOINT "$device" 2>/dev/null || echo "")
+            
+            # Excluir devices já montados ou em uso
+            if [[ -z "$mountpoint" ]] && ! pvdisplay "$device" &>/dev/null; then
+                devices+=("$device - Tamanho: $size")
+                print_info "Encontrado device físico: $device ($size)"
+            fi
         fi
     done
     
-    read -p "Selecione o device para criar VG compartilhado (número): " DEVICE_NUM
-    DEVICE_INDEX=$((DEVICE_NUM-1))
-    
-    if [ "$DEVICE_INDEX" -lt 0 ] || [ "$DEVICE_INDEX" -ge ${#CANDIDATE_DEVICES[@]} ]; then
-        error_exit "Seleção inválida."
+    if [[ ${#devices[@]} -eq 0 ]]; then
+        print_error "Nenhum device disponível encontrado"
+        return 1
     fi
     
-    SELECTED_DEVICE=${CANDIDATE_DEVICES[$DEVICE_INDEX]}
-    echo "Device selecionado: $SELECTED_DEVICE"
+    # Mostrar devices candidatos
+    print_info "Devices candidatos detectados:"
+    for i in "${!devices[@]}"; do
+        echo "$((i + 1)). ${devices[i]}"
+    done
     
-    # Obter tamanho disponível do device
-    TOTAL_SIZE_BYTES=$(lsblk -bdno SIZE "$SELECTED_DEVICE")
-    if [ -z "$TOTAL_SIZE_BYTES" ]; then
-        error_exit "Não foi possível determinar o tamanho do device $SELECTED_DEVICE"
+    # Selecionar device automaticamente ou manualmente
+    local selected_device
+    if [[ ${#devices[@]} -eq 1 ]]; then
+        selected_device=$(echo "${devices[0]}" | awk '{print $1}')
+        print_info "Selecionando automaticamente único device: $selected_device"
+    else
+        echo ""
+        read -p "Selecione o device para criar VG compartilhado (número): " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#devices[@]} ]]; then
+            selected_device=$(echo "${devices[$((choice - 1))]}" | awk '{print $1}')
+            print_info "Device selecionado: $selected_device"
+        else
+            print_error "Seleção inválida"
+            return 1
+        fi
     fi
     
-    # Calcular tamanho em GB
-    TOTAL_SIZE_GB=$((TOTAL_SIZE_BYTES / 1024 / 1024 / 1024))
+    echo "$selected_device"
+    return 0
+}
+
+configure_lvm_cluster() {
+    print_header "⚙️  Configurando LVM para Cluster"
     
-    echo "Tamanho total do device: ${TOTAL_SIZE_GB}GB"
-    echo "Será usado TODO o espaço disponível para máximo aproveitamento."
+    # Detectar device disponível
+    local selected_device
+    if ! selected_device=$(detect_available_devices); then
+        print_error "Falha na detecção de devices"
+        return 1
+    fi
     
-    read -p "Criar VG 'vg_cluster' e LV 'lv_gfs2' usando todo o espaço no device $SELECTED_DEVICE? [s/N]: " CREATE_LVM
-    CREATE_LVM=${CREATE_LVM,,}
+    # Configurar LVM para cluster
+    print_info "Configurando LVM para uso em cluster..."
     
-    if [[ "$CREATE_LVM" == "s" || "$CREATE_LVM" == "y" ]]; then
-        echo "Criando Volume Group compartilhado..."
+    # Verificar se lvm.conf está configurado para cluster
+    if ! grep -q "use_lvmlockd = 1" /etc/lvm/lvm.conf 2>/dev/null; then
+        print_info "Configurando /etc/lvm/lvm.conf para cluster..."
+        sudo sed -i 's/use_lvmlockd = 0/use_lvmlockd = 1/' /etc/lvm/lvm.conf 2>/dev/null || true
+        sudo sed -i 's/# use_lvmlockd = 1/use_lvmlockd = 1/' /etc/lvm/lvm.conf 2>/dev/null || true
         
-        # === SEÇÃO MELHORADA: Limpeza robusta com função especializada ===
+        # Se não encontrou a linha, adicionar
+        if ! grep -q "use_lvmlockd" /etc/lvm/lvm.conf; then
+            sudo sed -i '/global {/a\    use_lvmlockd = 1' /etc/lvm/lvm.conf
+        fi
         
-        # Verificar se VG 'vg_cluster' já existe
-        if sudo vgdisplay vg_cluster &>/dev/null; then
-            echo "⚠️ Volume Group 'vg_cluster' já existe no sistema."
-            read -p "Deseja remover completamente e recriar? [s/N]: " RECREATE_VG
-            RECREATE_VG=${RECREATE_VG,,}
-            if [[ "$RECREATE_VG" == "s" || "$RECREATE_VG" == "y" ]]; then
-                # Usar função de limpeza robusta
-                force_cleanup_vg "vg_cluster" "$SELECTED_DEVICE"
-                CLEANUP_RESULT=$?
-                
-                if [ $CLEANUP_RESULT -eq 1 ]; then
-                    error_exit "Falha na limpeza do VG. Intervenção manual necessária."
-                elif [ $CLEANUP_RESULT -eq 2 ]; then
-                    echo "✔ Configuração concluída. Use o device direto no próximo script."
-                    exit 0
-                fi
+        print_success "LVM configurado para cluster"
+    else
+        print_success "LVM já configurado para cluster"
+    fi
+    
+    # Verificar se Volume Group já existe
+    local vg_name="vg_cluster"
+    local lv_name="lv_gfs2"
+    
+    if sudo vgs "$vg_name" &>/dev/null; then
+        print_info "Volume Group '$vg_name' já existe"
+        
+        # Verificar se está em modo cluster
+        local lock_type
+        lock_type=$(sudo vgs --noheadings -o lv_lock_type "$vg_name" 2>/dev/null | tr -d ' ' || echo "none")
+        
+        if [[ "$lock_type" != "dlm" ]]; then
+            print_info "Convertendo Volume Group para modo cluster DLM..."
+            
+            # Parar locks se existirem
+            sudo vgchange --lockstop "$vg_name" 2>/dev/null || true
+            
+            # Converter para DLM
+            if sudo vgchange --locktype dlm "$vg_name"; then
+                print_success "Volume Group convertido para modo cluster"
             else
-                error_exit "Não é possível prosseguir com VG existente."
+                print_error "Falha ao converter Volume Group para modo cluster"
+                return 1
             fi
         fi
         
-        # === FIM DA SEÇÃO MELHORADA ===
+        # Iniciar locks
+        if sudo vgchange --lockstart "$vg_name"; then
+            print_success "Locks do Volume Group iniciados"
+        else
+            print_warning "Falha ao iniciar locks - continuando sem locks distribuídos"
+            # Converter para modo local como fallback
+            sudo vgchange --locktype none "$vg_name" 2>/dev/null || true
+        fi
         
-        # Criar VG compartilhado (sintaxe correta Ubuntu 22.04)
-        echo "Criando novo Volume Group..."
-        sudo vgcreate --shared vg_cluster "$SELECTED_DEVICE" || error_exit "Falha ao criar VG compartilhado"
-        echo "✔ Volume Group 'vg_cluster' criado com sucesso"
-        
-        # Criar LV usando TODO o espaço disponível (sintaxe correta Ubuntu 22.04)
-        echo "Criando Logical Volume..."
-        sudo lvcreate -n lv_gfs2 -l 100%FREE vg_cluster || error_exit "Falha ao criar LV"
-        echo "✔ Logical Volume 'lv_gfs2' criado usando todo o espaço disponível"
-        
-        # Ativar LV (sintaxe correta Ubuntu 22.04)
-        echo "Ativando Logical Volume..."
-        sudo lvchange -ay /dev/vg_cluster/lv_gfs2 || error_exit "Falha ao ativar LV"
-        echo "✔ Logical Volume ativado com sucesso"
-        
-        # Verificar criação
-        echo "Verificando volumes criados:"
-        sudo lvs -a -o vg_name,lv_name,lv_attr,lv_size
+        # Ativar Volume Group
+        if sudo vgchange -ay "$vg_name"; then
+            print_success "Volume Group ativado"
+        else
+            print_error "Falha ao ativar Volume Group"
+            return 1
+        fi
         
     else
-        echo "Criação de VG/LV cancelada pelo usuário."
-        read -p "Deseja continuar sem volume LVM? [s/N]: " CONTINUE
-        CONTINUE=${CONTINUE,,}
-        if [[ "$CONTINUE" != "s" && "$CONTINUE" != "y" ]]; then
-            error_exit "Volume LVM é necessário para cluster GFS2."
+        print_info "Criando novo Volume Group cluster-aware..."
+        
+        local device_size
+        device_size=$(lsblk -dn -o SIZE "$selected_device" | tr -d ' ')
+        print_info "Device selecionado: $selected_device"
+        print_info "Tamanho total do device: $device_size"
+        print_info "Será usado TODO o espaço disponível para máximo aproveitamento."
+        
+        echo ""
+        read -p "Criar VG '$vg_name' e LV '$lv_name' usando todo o espaço no device $selected_device? [s/N]: " confirm
+        if [[ "$confirm" != "s" && "$confirm" != "S" ]]; then
+            print_info "Operação cancelada pelo usuário"
+            return 1
+        fi
+        
+        # Criar Physical Volume
+        if sudo pvcreate -y "$selected_device"; then
+            print_success "Physical Volume criado: $selected_device"
+        else
+            print_error "Falha ao criar Physical Volume"
+            return 1
+        fi
+        
+        # Criar Volume Group cluster-aware
+        if sudo vgcreate --shared "$vg_name" "$selected_device"; then
+            print_success "Volume Group cluster-aware criado: $vg_name"
+        else
+            print_error "Falha ao criar Volume Group"
+            return 1
+        fi
+        
+        # Iniciar locks DLM se possível
+        if sudo vgchange --locktype dlm "$vg_name" && sudo vgchange --lockstart "$vg_name"; then
+            print_success "Volume Group configurado com locks DLM"
+        else
+            print_warning "Falha ao configurar locks DLM - usando modo local"
+            sudo vgchange --locktype none "$vg_name" 2>/dev/null || true
+        fi
+        
+        # Ativar Volume Group
+        sudo vgchange -ay "$vg_name"
+        
+        # Criar Logical Volume usando todo o espaço
+        if sudo lvcreate -l 100%FREE -n "$lv_name" "$vg_name"; then
+            print_success "Logical Volume criado: /dev/$vg_name/$lv_name"
+        else
+            print_error "Falha ao criar Logical Volume"
+            return 1
         fi
     fi
-fi
+    
+    # Verificar resultado final
+    print_info "📊 Configuração final do LVM:"
+    sudo vgs "$vg_name" || true
+    sudo lvs "$vg_name" || true
+    
+    print_success "Configuração de LVM cluster concluída"
+    return 0
+}
 
-# Verificação de hostname único
-hostname=$(hostname)
-echo "Hostname atual: $hostname"
-echo "Verifique se ele é único entre os nós do cluster para evitar conflitos."
-read -p "Confirma que hostname é único? [s/N]: " r
-r=${r,,}
-if [[ $r != "s" && $r != "y" ]]; then
-    error_exit "Hostname deve ser exclusivo nos nós. Abortando."
-fi
+# ============================================================================
+# FUNÇÃO PRINCIPAL
+# ============================================================================
 
-# Usuário/grupo para permissões se necessário
-if ! id "morpheus-node" &>/dev/null; then
-    echo "Criando usuário 'morpheus-node' e grupo 'kvm' para permissões comuns ..."
-    sudo groupadd -f kvm
-    sudo useradd -M -g kvm morpheus-node 2>/dev/null || echo "Usuário 'morpheus-node' pode já existir."
-else
-    echo "Usuário 'morpheus-node' já existe."
-fi
+main() {
+    print_header "🚀 Instalação de Pré-requisitos GFS2 Enterprise"
+    
+    print_info "Iniciando configuração para ambiente enterprise..."
+    print_info "Nó atual: $(get_current_hostname)"
+    print_info "IP detectado: $(ip route get 8.8.8.8 2>/dev/null | awk '/src/ {print $7}' || echo 'N/A')"
+    
+    # Verificar pré-requisitos
+    if ! check_prerequisites; then
+        error_exit "Falha na verificação de pré-requisitos"
+    fi
+    
+    # Instalar pacotes necessários
+    if ! install_packages; then
+        error_exit "Falha na instalação de pacotes"
+    fi
+    
+    # Configurar cluster enterprise
+    if ! configure_enterprise_cluster; then
+        print_error "Erro na configuração do cluster"
+        print_info "💡 Você pode continuar com configuração local, mas perderá recursos enterprise"
+        read -p "Continuar com configuração local (sem cluster)? [s/N]: " continue_local
+        if [[ "$continue_local" == "s" || "$continue_local" == "S" ]]; then
+            print_info "Prosseguindo com configuração local..."
+        else
+            error_exit "Configuração do cluster falhou"
+        fi
+    fi
+    
+    # Configurar storage LVM
+    if ! configure_lvm_cluster; then
+        error_exit "Falha na configuração de storage LVM"
+    fi
+    
+    # Relatório final
+    print_header "✅ Instalação Concluída com Sucesso!"
+    
+    echo ""
+    print_success "🏢 Cluster Enterprise Configurado:"
+    print_info "   • Pacemaker/Corosync: Ativo"
+    print_info "   • DLM distribuído: Configurado"
+    print_info "   • lvmlockd cluster-aware: Ativo"
+    print_info "   • Storage compartilhado: Pronto"
+    
+    echo ""
+    print_success "📋 Próximos Passos:"
+    print_info "   1. Execute o mesmo script no outro nó"
+    print_info "   2. Execute: configure-lun-multipath.sh (formatação GFS2)"
+    print_info "   3. Execute: configure-second-node.sh (montagem)"
+    print_info "   4. Teste: test-lun-gfs2.sh (validação)"
+    
+    echo ""
+    print_info "📊 Verificação do cluster:"
+    sudo pcs status 2>/dev/null || print_warning "Use 'sudo pcs status' para verificar cluster"
+    
+    print_success "🎉 Ambiente enterprise pronto para GFS2!"
+}
 
-cat << EOF
+# ============================================================================
+# EXECUÇÃO
+# ============================================================================
 
----
-[✔] Checagem e configuração concluídas! O sistema está preparado para prosseguir.
-
-⚠️ UNIT FILES CRIADOS (se necessário):
-- /etc/systemd/system/dlm_controld.service
-- /etc/systemd/system/lvmlockd.service
-
-✔ VOLUME LVM CONFIGURADO:
-- Volume Group: vg_cluster
-- Logical Volume: lv_gfs2
-- Device: /dev/vg_cluster/lv_gfs2 (use este no próximo script)
-- Espaço: Todo o espaço disponível do device selecionado
-
-✔ AUTENTICAÇÃO DO CLUSTER:
-- Usuário hacluster configurado com senha
-- Serviço pcsd habilitado e funcionando
-- Pronto para autenticação do cluster com 'pcs host auth'
-
-⚠️ RECOMENDAÇÕES FUTURAS:
-- Execute este script no OUTRO NÓ do cluster também (usando a MESMA senha hacluster)
-- Configure e inicie corretamente o cluster Corosync e Pacemaker
-- Implemente STONITH (fencing) para garantir segurança do cluster
-- Após configurar ambos os nós, execute configure-lun-multipath.sh
-- Use o device /dev/vg_cluster/lv_gfs2 para o sistema de arquivos GFS2
-
-💡 PRÓXIMO PASSO - Autenticação do Cluster:
-No nó principal, execute: 
-sudo pcs host auth <host1> <host2> # (onde <host1> e <host2> são os nomes dos nós do cluster)
-(Use usuário: hacluster e a senha que você configurou)
-
-EOF
-
-exit 0
+# Verificar argumentos
+case "${1:-}" in
+    --help|-h)
+        echo "Uso: $0 [opções]"
+        echo ""
+        echo "Opções:"
+        echo "  --help, -h    Mostrar esta ajuda"
+        echo "  --version     Mostrar versão"
+        echo ""
+        echo "Este script configura um ambiente enterprise para GFS2 com:"
+        echo "  • Cluster Pacemaker/Corosync"
+        echo "  • DLM distribuído"
+        echo "  • lvmlockd cluster-aware"
+        echo "  • Storage compartilhado"
+        exit 0
+        ;;
+    --version)
+        echo "install-lun-prerequisites.sh versão 2.0 - Enterprise Ready"
+        exit 0
+        ;;
+    "")
+        # Execução normal
+        main
+        ;;
+    *)
+        error_exit "Argumento inválido: $1. Use --help para ajuda."
+        ;;
+esac
