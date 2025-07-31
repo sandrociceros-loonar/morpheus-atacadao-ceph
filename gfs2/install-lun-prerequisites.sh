@@ -7,6 +7,7 @@
 # FUNCIONALIDADES PRINCIPAIS:
 # - Instala pacotes essenciais para cluster GFS2 (gfs2-utils, corosync, pacemaker, etc.)
 # - Configura serviços de cluster (multipathd, dlm_controld, lvmlockd)
+# - Configura senha do usuário hacluster para autenticação do cluster
 # - Cria unit files systemd personalizados para dlm_controld e lvmlockd (Ubuntu 22.04)
 # - Ajusta configuração LVM para uso em cluster (/etc/lvm/lvm.conf)
 # - Detecta automaticamente devices disponíveis (multipath ou diretos)
@@ -23,20 +24,10 @@
 # USO:
 # 1. Execute em AMBOS os nós do cluster
 # 2. Siga os prompts interativos
-# 3. Após sucesso, execute configure-lun-multipath.sh
+# 3. Use a MESMA senha do hacluster em ambos os nós
+# 4. Após sucesso, execute configure-lun-multipath.sh
 #
-# SAÍDA ESPERADA:
-# - Todos os serviços essenciais ativos
-# - Volume LVM compartilhado criado (/dev/vg_cluster/lv_gfs2)
-# - Sistema pronto para configuração GFS2
-#
-# COMPATIBILIDADE:
-# - Ubuntu 22.04 (adaptado para ausência de unit files systemd padrão)
-# - Multipath devices (/dev/mapper/*)
-# - Devices diretos (/dev/sd*)
-# - Ambientes físicos e virtualizados (Proxmox, VMware, etc.)
-#
-# VERSÃO: 2.4 - Limpeza manual robusta de VGs existentes
+# VERSÃO: 2.5 - Inclui configuração automática da senha hacluster
 ################################################################################
 
 function error_exit {
@@ -202,6 +193,52 @@ else
     echo "✔ Todos os pacotes necessários já estão instalados."
 fi
 
+# === Configuração da senha do usuário hacluster ===
+echo "Configurando senha para usuário hacluster (necessário para autenticação do cluster)..."
+
+if id hacluster &>/dev/null; then
+    echo "✔ Usuário hacluster encontrado"
+    
+    # Verificar se senha já foi configurada via variável de ambiente
+    if [ -z "$HACLUSTER_PASSWORD" ]; then
+        read -s -p "Digite a senha para o usuário hacluster (mesma em todos os nós): " HACLUSTER_PASSWORD
+        echo
+        read -s -p "Confirme a senha: " HACLUSTER_PASSWORD_CONFIRM
+        echo
+        
+        if [ "$HACLUSTER_PASSWORD" != "$HACLUSTER_PASSWORD_CONFIRM" ]; then
+            error_exit "Senhas não coincidem. Execute o script novamente."
+        fi
+    else
+        echo "Usando senha fornecida via variável de ambiente HACLUSTER_PASSWORD"
+    fi
+    
+    # Configurar senha usando o método mais compatível
+    echo "Configurando senha do usuário hacluster..."
+    echo "$HACLUSTER_PASSWORD" | sudo passwd --stdin hacluster 2>/dev/null || {
+        # Fallback para sistemas que não suportam --stdin
+        echo -e "$HACLUSTER_PASSWORD\n$HACLUSTER_PASSWORD" | sudo passwd hacluster
+    }
+    
+    if [ $? -eq 0 ]; then
+        echo "✔ Senha do usuário hacluster configurada com sucesso"
+    else
+        error_exit "Falha ao configurar senha do usuário hacluster"
+    fi
+else
+    echo "⚠️ Usuário hacluster não encontrado. Isso é normal se os pacotes do cluster ainda não foram instalados."
+    echo "O usuário será criado automaticamente durante a instalação dos pacotes."
+fi
+
+# Iniciar e habilitar serviço pcsd (necessário para autenticação do cluster)
+echo "Iniciando e habilitando serviço pcsd..."
+sudo systemctl enable --now pcsd
+if [ $? -eq 0 ]; then
+    echo "✔ Serviço pcsd iniciado e habilitado com sucesso"
+else
+    echo "⚠️ Aviso: Problema ao iniciar pcsd, mas continuando com o script..."
+fi
+
 # Verificar serviço multipathd (tem unit file systemd)
 echo "Verificando serviço multipathd..."
 if check_service_active "multipathd" && check_service_enabled "multipathd"; then
@@ -351,7 +388,7 @@ for clustsvc in corosync pacemaker; do
     fi
 done
 
-# === Configuração automática de Volume LVM Compartilhado (Com Limpeza Robusta) ===
+# === Configuração automática de Volume LVM Compartilhado (Melhorada) ===
 echo "Verificando e configurando Volumes Lógicos LVM para compartilhar a LUN..."
 
 # Verificar se já existe volume compartilhado
@@ -514,12 +551,22 @@ cat << EOF
 - Device: /dev/vg_cluster/lv_gfs2 (use este no próximo script)
 - Espaço: Todo o espaço disponível do device selecionado
 
+✔ AUTENTICAÇÃO DO CLUSTER:
+- Usuário hacluster configurado com senha
+- Serviço pcsd habilitado e funcionando
+- Pronto para autenticação do cluster com 'pcs host auth'
+
 ⚠️ RECOMENDAÇÕES FUTURAS:
-- Execute este script no OUTRO NÓ do cluster também
+- Execute este script no OUTRO NÓ do cluster também (usando a MESMA senha hacluster)
 - Configure e inicie corretamente o cluster Corosync e Pacemaker
 - Implemente STONITH (fencing) para garantir segurança do cluster
 - Após configurar ambos os nós, execute configure-lun-multipath.sh
 - Use o device /dev/vg_cluster/lv_gfs2 para o sistema de arquivos GFS2
+
+💡 PRÓXIMO PASSO - Autenticação do Cluster:
+No nó principal, execute: 
+sudo pcs host auth <host1> <host2> # (onde <host1> e <host2> são os nomes dos nós do cluster)
+(Use usuário: hacluster e a senha que você configurou)
 
 EOF
 
