@@ -36,6 +36,7 @@
 # - Devices diretos (/dev/sd*)
 # - Ambientes físicos e virtualizados (Proxmox, VMware, etc.)
 #
+# VERSÃO: 2.1 - Inclui correção configuração LVM para cluster
 ################################################################################
 
 function error_exit {
@@ -197,14 +198,34 @@ else
     error_exit "lvmlockd ausente, não é possível prosseguir."
 fi
 
-# Assegurar configuração mínima em /etc/lvm/lvm.conf
-echo "Ajustando configuração do LVM para cluster locking..."
-if ! grep -q "use_lvmlockd.*=.*1" /etc/lvm/lvm.conf; then
-    sudo sed -i 's/^ *use_lvmlockd *=.*/use_lvmlockd = 1/' /etc/lvm/lvm.conf 2>/dev/null || {
-        echo "use_lvmlockd = 1" | sudo tee -a /etc/lvm/lvm.conf > /dev/null
-    }
+# === Configuração LVM para Cluster (Seção Corrigida) ===
+echo "Configurando LVM adequadamente para cluster sharing..."
+
+# Backup da configuração atual
+sudo cp /etc/lvm/lvm.conf /etc/lvm/lvm.conf.backup.$(date +%Y%m%d_%H%M%S)
+
+# Remover configurações conflitantes
+sudo sed -i '/use_lvmlockd/d' /etc/lvm/lvm.conf
+sudo sed -i '/locking_type/d' /etc/lvm/lvm.conf  
+sudo sed -i '/shared_activation/d' /etc/lvm/lvm.conf
+
+# Aplicar configurações corretas para cluster
+sudo sed -i '/^global {/a\    use_lvmlockd = 1\n    locking_type = 1' /etc/lvm/lvm.conf
+sudo sed -i '/^activation {/a\    shared_activation = 1' /etc/lvm/lvm.conf
+
+echo "✔ Configurações LVM para cluster aplicadas:"
+grep -E "(use_lvmlockd|locking_type|shared_activation)" /etc/lvm/lvm.conf
+
+# Reiniciar lvmlockd para aplicar configurações
+echo "Reiniciando lvmlockd para aplicar novas configurações..."
+sudo systemctl restart lvmlockd
+sleep 3
+
+if pgrep -x lvmlockd >/dev/null; then
+    echo "✔ lvmlockd configurado e funcionando para cluster"
+else
+    error_exit "Falha ao configurar lvmlockd para cluster"
 fi
-grep -q "use_lvmlockd.*=.*1" /etc/lvm/lvm.conf && echo "✔ use_lvmlockd = 1 presente em /etc/lvm/lvm.conf"
 
 # Checagem dos serviços de cluster corosync/pacemaker
 echo "Verificando serviços de cluster corosync e pacemaker..."
@@ -221,7 +242,7 @@ for clustsvc in corosync pacemaker; do
     fi
 done
 
-# === NOVA SEÇÃO: Configuração automática de Volume LVM Compartilhado ===
+# === Configuração automática de Volume LVM Compartilhado ===
 echo "Verificando e configurando Volumes Lógicos LVM para compartilhar a LUN..."
 
 # Verificar se já existe volume compartilhado
