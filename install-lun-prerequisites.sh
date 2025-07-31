@@ -64,6 +64,20 @@ else
     echo "✔ Todos os pacotes necessários já estão instalados."
 fi
 
+# Verificar se o pacote dlm está disponível nos repositórios
+if ! apt-cache show dlm &>/dev/null; then
+    echo "⚠️  O pacote 'dlm' não está disponível nos repositórios padrão."
+    echo "Certifique-se de que o repositório correto está configurado ou instale manualmente o pacote necessário."
+    echo "Para Ubuntu 24.04, o pacote pode ter sido renomeado ou movido para outro repositório."
+    read -p "Deseja continuar sem instalar 'dlm'? [s/N]: " r
+    r=${r,,}
+    if [[ $r != "s" && $r != "y" ]]; then
+        error_exit "Pacote 'dlm' ausente. Abortando."
+    fi
+    # Remover 'dlm' da lista de pacotes a serem instalados
+    PKGS=("${PKGS[@]/dlm}")
+fi
+
 # Serviços essenciais
 SERVICOS=(multipathd dlm lvmlockd)
 for serv in "${SERVICOS[@]}"; do
