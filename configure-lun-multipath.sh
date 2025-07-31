@@ -5,6 +5,66 @@ function error_exit {
     exit 1
 }
 
+# === SOLICITAR NOME DO CLUSTER ===
+echo "=== Configuração do Nome do Cluster ==="
+echo "O nome do cluster será usado para:"
+echo "- Sistema de arquivos GFS2 (cluster_name:volume_name)"
+echo "- Coordenação com DLM e Corosync"
+echo "- Identificação única do cluster"
+echo
+
+# Detectar nome atual do cluster se existir
+CURRENT_CLUSTER_NAME=""
+if command -v pcs &>/dev/null; then
+    CURRENT_CLUSTER_NAME=$(sudo pcs status cluster 2>/dev/null | grep -i "cluster name" | awk '{print $3}' || true)
+    if [ -z "$CURRENT_CLUSTER_NAME" ]; then
+        # Tentar obter do corosync.conf
+        CURRENT_CLUSTER_NAME=$(sudo grep -E "^\s*cluster_name:" /etc/corosync/corosync.conf 2>/dev/null | awk '{print $2}' || true)
+    fi
+fi
+
+if [ -n "$CURRENT_CLUSTER_NAME" ]; then
+    echo "Nome do cluster atual detectado: $CURRENT_CLUSTER_NAME"
+    read -p "Deseja usar este nome ou definir um novo? [usar atual/novo]: " CLUSTER_CHOICE
+    CLUSTER_CHOICE=$(echo "${CLUSTER_CHOICE:-usar atual}" | tr '[:upper:]' '[:lower:]')
+    if [[ "$CLUSTER_CHOICE" =~ ^(usar|atual|u|a)$ ]]; then
+        CLUSTER_NAME="$CURRENT_CLUSTER_NAME"
+        echo "✔ Usando nome do cluster atual: $CLUSTER_NAME"
+    else
+        read -p "Digite o nome do cluster desejado: " CLUSTER_NAME
+    fi
+else
+    echo "Nenhum cluster detectado ou nome não encontrado."
+    read -p "Digite o nome do cluster desejado: " CLUSTER_NAME
+fi
+
+# Validar nome do cluster
+if [ -z "$CLUSTER_NAME" ]; then
+    error_exit "Nome do cluster não pode estar vazio"
+fi
+
+# Validar formato do nome (sem espaços, caracteres especiais)
+if [[ ! "$CLUSTER_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    error_exit "Nome do cluster deve conter apenas letras, números, hífens e underscores"
+fi
+
+echo "✔ Nome do cluster configurado: $CLUSTER_NAME"
+echo
+
+# === SOLICITAR NOME DO VOLUME GFS2 ===
+DEFAULT_VOLUME_NAME="gfs2vol"
+read -p "Nome do volume GFS2 [$DEFAULT_VOLUME_NAME]: " VOLUME_NAME
+VOLUME_NAME=${VOLUME_NAME:-$DEFAULT_VOLUME_NAME}
+
+# Validar nome do volume
+if [[ ! "$VOLUME_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    error_exit "Nome do volume deve conter apenas letras, números, hífens e underscores"
+fi
+
+echo "✔ Nome do volume GFS2: $VOLUME_NAME"
+echo "✔ Identificador completo do filesystem: $CLUSTER_NAME:$VOLUME_NAME"
+echo
+
 # === VERIFICA E CONFIGURA STONITH DUMMY SE NÃO EXISTE (apenas para laboratório!) ===
 STONITH_OK=$(sudo pcs stonith show 2>/dev/null | grep fence_dummy)
 if [ -z "$STONITH_OK" ]; then
@@ -215,6 +275,9 @@ if [ -n "$MONTADO" ] || [ -n "$FSTAB_EXISTS" ]; then
 fi
 
 echo "O device $DEVICE será formatado como GFS2 e montado em $MOUNT_POINT."
+echo "Nome do cluster: $CLUSTER_NAME"
+echo "Nome do volume: $VOLUME_NAME"
+echo "Identificador GFS2: $CLUSTER_NAME:$VOLUME_NAME"
 read -p "Confirma? (S/N): " CONFIRM
 CONFIRM=$(echo "$CONFIRM" | tr '[:upper:]' '[:lower:]')
 if [[ "$CONFIRM" != "s" && "$CONFIRM" != "y" ]]; then
@@ -222,8 +285,9 @@ if [[ "$CONFIRM" != "s" && "$CONFIRM" != "y" ]]; then
     exit 0
 fi
 
-# Tenta formatar
-sudo mkfs.gfs2 -j2 -p lock_dlm -t meucluster:gfs2vol "$DEVICE"
+# Tenta formatar usando o nome do cluster fornecido pelo usuário
+echo "Formatando $DEVICE como GFS2 com identificador $CLUSTER_NAME:$VOLUME_NAME..."
+sudo mkfs.gfs2 -j2 -p lock_dlm -t "$CLUSTER_NAME:$VOLUME_NAME" "$DEVICE"
 MKFS_RC=$?
 
 if [ $MKFS_RC -ne 0 ]; then
@@ -249,7 +313,7 @@ if [ $MKFS_RC -ne 0 ]; then
         sudo partprobe "$DEVICE" 2>/dev/null
 
         echo "Tentando nova formatação como GFS2..."
-        sudo mkfs.gfs2 -j2 -p lock_dlm -t meucluster:gfs2vol "$DEVICE" || error_exit "Ainda falhou ao formatar $DEVICE para GFS2"
+        sudo mkfs.gfs2 -j2 -p lock_dlm -t "$CLUSTER_NAME:$VOLUME_NAME" "$DEVICE" || error_exit "Ainda falhou ao formatar $DEVICE para GFS2"
     else
         error_exit "Não foi possível preparar/formatar o device. Revisão manual obrigatória."
     fi
@@ -259,6 +323,7 @@ if [ ! -d "$MOUNT_POINT" ]; then
     sudo mkdir -p "$MOUNT_POINT" || error_exit "Falha ao criar diretório $MOUNT_POINT"
 fi
 
+echo "Montando $DEVICE em $MOUNT_POINT..."
 sudo mount -t gfs2 -o lockproto=lock_dlm,sync "$DEVICE" "$MOUNT_POINT" || error_exit "Falha ao montar $DEVICE em $MOUNT_POINT"
 
 if grep -qs "$MOUNT_POINT" /etc/fstab; then
@@ -275,7 +340,10 @@ cat << EOF
 ---
 [✔] Configuração concluída!
 
-✔ DEVICE CONFIGURADO:
+✔ CLUSTER GFS2 CONFIGURADO:
+- Nome do cluster: $CLUSTER_NAME
+- Nome do volume: $VOLUME_NAME
+- Identificador GFS2: $CLUSTER_NAME:$VOLUME_NAME
 - Device utilizado: $DEVICE
 - Sistema de arquivos: GFS2
 - Ponto de montagem: $MOUNT_POINT
@@ -283,11 +351,11 @@ cat << EOF
 
 ⚠️ RECOMENDAÇÕES FUTURAS:
 - Certifique-se de que os serviços do cluster (corosync, pacemaker) estão ativos e funcionais em ambos os nós.
-- Garanta que o nome do cluster (exemplo: meucluster:gfs2vol) usado no mkfs.gfs2 seja o mesmo em todos os nós.
+- Garanta que o nome do cluster '$CLUSTER_NAME' é o mesmo em todos os nós do cluster.
 - Configure STONITH (fencing) válido para produção! Este dummy/desabilitado serve apenas para LAB.
 - Realize testes de leitura/escrita em ambos os nós para validar a sincronização.
 - Execute o script test-lun-gfs2.sh para validar o funcionamento completo.
----
+- No segundo nó, use o MESMO nome de cluster ($CLUSTER_NAME) quando executar este script.
 
 EOF
 
