@@ -569,6 +569,7 @@ detect_available_devices() {
     
     echo "$selected_device"
     return 0
+}
 
 configure_lvm_cluster() {
     print_header "⚙️  Configurando LVM para Cluster"
