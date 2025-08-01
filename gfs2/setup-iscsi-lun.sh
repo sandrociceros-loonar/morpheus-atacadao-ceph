@@ -266,14 +266,16 @@ defaults {
     user_friendly_names yes
     find_multipaths yes
     path_selector "round-robin 0"
-    polling_interval 10
+    polling_interval 5
     path_checker "tur"
     prio "const"
-    prio_args "1 alua"
+    prio_args "1"
     path_grouping_policy multibus
     failback immediate
     rr_weight uniform
     no_path_retry fail
+    dev_loss_tmo infinity
+    fast_io_fail_tmo 5
 }
 
 blacklist {
@@ -288,12 +290,14 @@ devices {
         product ".*"
         path_checker tur
         path_selector "round-robin 0"
-        path_grouping_policy group_by_prio
+        path_grouping_policy failover
         failback immediate
-        prio alua
-        hardware_handler "1 alua"
+        prio const
         rr_weight uniform
         rr_min_io 100
+        no_path_retry 5
+        dev_loss_tmo infinity
+        fast_io_fail_tmo 5
     }
 }
 
