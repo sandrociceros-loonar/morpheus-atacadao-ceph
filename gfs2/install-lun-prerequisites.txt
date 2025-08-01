@@ -1003,36 +1003,6 @@ main() {
     print_success "🎉 Ambiente enterprise pronto para GFS2!"
 }
 
-# Adicione esta função no início do script
-check_dlm_support() {
-    print_header "🔍 Verificando Suporte a DLM no Kernel"
-    
-    # Verificar se módulo DLM existe
-    if ! find /lib/modules/$(uname -r) -name "*dlm*" 2>/dev/null | grep -q dlm; then
-        print_error "Módulo DLM não encontrado no kernel $(uname -r)"
-        print_info "Soluções possíveis:"
-        print_info "1. sudo apt install linux-generic linux-modules-extra-$(uname -r)"
-        print_info "2. sudo apt install --install-recommends linux-generic-hwe-22.04"
-        print_info "3. Reiniciar e usar kernel com suporte completo"
-        return 1
-    fi
-    
-    # Tentar carregar módulo DLM
-    if ! sudo modprobe dlm 2>/dev/null; then
-        print_error "Não foi possível carregar módulo DLM"
-        return 1
-    fi
-    
-    print_success "Módulo DLM disponível e carregado"
-    return 0
-}
-
-# Chame esta função antes de configurar o cluster
-if ! check_dlm_support; then
-    error_exit "Sistema não tem suporte a DLM. Instale kernel completo primeiro."
-fi
-
-
 # ============================================================================
 # EXECUÇÃO
 # ============================================================================
