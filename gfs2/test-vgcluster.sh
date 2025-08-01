@@ -2,7 +2,7 @@
 # ============================================================================
 # SCRIPT: test-vgcluster.sh
 # DESCRIÇÃO: Testa o bloqueio DLM no VG 'vg_cluster'
-#            - Inicia e habilita lvm2-lockd.service
+#            - Inicia e habilita o serviço correto de lockd (lvm2-lockd ou lvmlockd)
 #            - Verifica status do serviço
 #            - Exibe logs recentes
 #            - Testa vgchange --lockstart e exibe LockType
@@ -12,6 +12,7 @@
 set -euo pipefail
 
 VG="vg_cluster"
+SERVICES=(lvm2-lockd lvmlockd)
 
 print_header() {
   echo
@@ -27,22 +28,32 @@ print_error() {
   echo "[FAIL]  $1"
 }
 
-# 1) Habilitar e iniciar lvm2-lockd
-print_header "1) Habilitando e iniciando lvm2-lockd.service"
-if sudo systemctl enable --now lvm2-lockd.service; then
-  print_success "lvm2-lockd.service habilitado e iniciado"
-else
-  print_error "Falha ao iniciar lvm2-lockd.service"
+# 1) Encontrar e iniciar serviço de lockd
+print_header "1) Iniciando serviço de lockd"
+LOCKD_SERVICE=""
+for svc in "${SERVICES[@]}"; do
+  if systemctl list-unit-files | grep -q "^${svc}.service"; then
+    LOCKD_SERVICE="${svc}.service"
+    break
+  fi
+done
+
+if [[ -z "$LOCKD_SERVICE" ]]; then
+  print_error "Nenhum serviço de lockd encontrado (lvm2-lockd.service ou lvmlockd.service)"
   exit 1
 fi
 
-# 2) Verificar status do serviço
-print_header "2) Status de lvm2-lockd.service"
-sudo systemctl status lvm2-lockd.service --no-pager -n0 || print_error "Serviço não encontrado ou não ativo"
+sudo systemctl enable --now "$LOCKD_SERVICE" \
+  && print_success "$LOCKD_SERVICE habilitado e iniciado" \
+  || { print_error "Falha ao iniciar $LOCKD_SERVICE"; exit 1; }
 
-# 3) Exibir logs recentes do serviço
-print_header "3) Logs do journalctl para lvm2-lockd.service"
-journalctl -u lvm2-lockd.service -n 50 --no-pager
+# 2) Verificar status
+print_header "2) Status de $LOCKD_SERVICE"
+systemctl status "$LOCKD_SERVICE" --no-pager -n0 || print_error "Serviço não ativo"
+
+# 3) Logs recentes
+print_header "3) Logs do journalctl para $LOCKD_SERVICE"
+journalctl -u "$LOCKD_SERVICE" -n 50 --no-pager
 
 # 4) Testar vgchange lockstart
 print_header "4) Testando vgchange --lockstart $VG"
