@@ -504,20 +504,44 @@ detect_available_devices() {
     
     # Debug: mostrar saída do comando multipath -ll
     print_info "Saída do multipath -ll:"
-    multipath -ll
+    sudo multipath -ll
     
-    # Procurar devices multipath ativos
+    print_info "Conteúdo do /dev/mapper:"
+    ls -l /dev/mapper/
+    
+    print_info "Procurando devices multipath ativos..."
+    
+    # Primeiro, vamos tentar o device específico fc-lun-cluster
+    if [[ -b "/dev/mapper/fc-lun-cluster" ]]; then
+        print_info "Encontrado device fc-lun-cluster"
+        check_and_add_device "/dev/mapper/fc-lun-cluster" "multipath"
+    fi
+    
+    # Depois, procurar outros devices multipath
+    local mpaths
+    mpaths=$(sudo multipath -l)
+    print_info "Saída completa do multipath -l:"
+    echo "$mpaths"
+    
     while IFS= read -r line; do
-        if [[ $line =~ ^([^[:space:]]+).*dm-[0-9]+ ]]; then
+        # Debug da linha atual
+        print_info "Processando linha: $line"
+        
+        if [[ $line =~ ^([[:alnum:]_-]+)[[:space:]] ]]; then
             local mp_name="${BASH_REMATCH[1]}"
             local mp_device="/dev/mapper/$mp_name"
+            
+            print_info "Encontrado nome multipath: $mp_name"
+            print_info "Verificando device: $mp_device"
             
             if [[ -b "$mp_device" ]]; then
                 print_info "Encontrado device multipath ativo: $mp_device"
                 check_and_add_device "$mp_device" "multipath"
+            else
+                print_info "Device $mp_device não existe como block device"
             fi
         fi
-    done < <(multipath -l | grep -v "^$")
+    done < <(echo "$mpaths" | grep "^[[:alnum:]_-]" || true)
     
     # Procurar por LUNs em /dev/disk/by-id (especialmente wwn e scsi)
     print_info "Procurando LUNs por WWN e SCSI ID..."
