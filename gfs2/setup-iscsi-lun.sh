@@ -133,11 +133,30 @@ echo "$DISCOVERY" | while IFS= read -r line; do
     
     echo "Conectando a $IQN..."
     
-    if sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --login 2>/dev/null; then
+    # Primeiro, remove qualquer configuração antiga
+    sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" -u >/dev/null 2>&1 || true
+    sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=delete >/dev/null 2>&1 || true
+    
+    # Configura o nó
+    sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=new
+    sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=update -n node.startup -v automatic
+    sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=update -n node.session.auth.authmethod -v None
+    
+    # Tenta conectar com mais informações de debug
+    if ! sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --login; then
+        echo "Primeira tentativa falhou, aguardando 5 segundos e tentando novamente..."
+        sleep 5
+        if sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --login; then
+            echo "✅ Conectado a $IQN na segunda tentativa"
+            ((CONNECTED++))
+        else
+            echo "❌ Falha ao conectar a $IQN"
+            echo "Detalhes do nó:"
+            sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=show
+        fi
+    else
         echo "✅ Conectado a $IQN"
         ((CONNECTED++))
-    else
-        echo "❌ Falha ao conectar a $IQN"
     fi
     sleep 2
 done
@@ -164,20 +183,38 @@ sudo iscsiadm -m session --rescan 2>/dev/null || true
 sleep 10
 
 # Detectar dispositivos
+echo "Estado atual das sessões iSCSI:"
+sudo iscsiadm -m session -P 3
+
 DEVICES=""
 for i in {1..10}; do
+    echo "Tentativa $i de detectar dispositivos..."
+    echo "Output do lsscsi:"
+    lsscsi
+    
     # Procura por discos PROXMOX FC-SIM ou qualquer outro disco conectado via iSCSI
-    DEVICES=$(lsscsi 2>/dev/null | grep -E "disk.*PROXMOX.*FC-SIM|disk.*IET" | awk '{print $NF}' | grep -v '^-$' | head -1)
-    [[ -n "$DEVICES" ]] && break
-    echo "Aguardando dispositivos... ($i/10)"
+    DEVICES=$(lsscsi | grep -E "disk.*PROXMOX.*FC-SIM|disk.*IET" | awk '{print $NF}' | grep "^/dev" | head -1)
+    
+    if [[ -n "$DEVICES" && -b "$DEVICES" ]]; then
+        echo "Dispositivo encontrado: $DEVICES"
+        break
+    fi
+    
+    echo "Tentando rescan dos dispositivos..."
+    sudo iscsiadm -m session --rescan >/dev/null 2>&1 || true
+    sudo iscsiadm -m node --rescan >/dev/null 2>&1 || true
     sleep 5
 done
 
-if [[ -z "$DEVICES" ]]; then
-    echo "ERRO: Nenhum dispositivo detectado"
+if [[ -z "$DEVICES" || ! -b "$DEVICES" ]]; then
+    echo "ERRO: Nenhum dispositivo válido detectado"
     echo "Sessões: $SESSIONS"
     echo "Dispositivos SCSI:"
     lsscsi
+    echo "Estado das sessões iSCSI:"
+    sudo iscsiadm -m session -P 3
+    echo "Estado dos nós iSCSI:"
+    sudo iscsiadm -m node -P 1
     exit 1
 fi
 
