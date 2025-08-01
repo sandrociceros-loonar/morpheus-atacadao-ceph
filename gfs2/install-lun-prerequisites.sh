@@ -445,66 +445,84 @@ detect_available_devices() {
     print_header "💾 Detectando Devices de Storage Disponíveis"
     
     local devices=()
+    local processed_devices=()
     
-    # Procurar por devices multipath
-    if ls /dev/mapper/fc-* &>/dev/null; then
-        for device in /dev/mapper/fc-*; do
-            if [[ -b "$device" && "$device" != "/dev/mapper/control" ]]; then
-                local size
-                size=$(lsblk -dn -o SIZE "$device" 2>/dev/null || echo "N/A")
-                devices+=("$device - Tamanho: $size")
-                print_info "Encontrado device multipath: $device ($size)"
+    # Função auxiliar para verificar e adicionar device
+    check_and_add_device() {
+        local device="$1"
+        local type="$2"
+        local real_device
+        
+        # Resolver link simbólico para o device real
+        real_device=$(readlink -f "$device")
+        
+        # Verificar se já processamos este device
+        for processed in "${processed_devices[@]}"; do
+            if [[ "$processed" == "$real_device" ]]; then
+                return 0
             fi
         done
-    fi
-    
-    # Procurar por devices físicos adequados (excluir disco do sistema)
-    for device in /dev/sd[b-z]; do
+        processed_devices+=("$real_device")
+        
         if [[ -b "$device" ]]; then
             local size
             size=$(lsblk -dn -o SIZE "$device" 2>/dev/null || echo "N/A")
+            local wwn
+            wwn=$(lsblk -dn -o WWN "$device" 2>/dev/null || echo "N/A")
+            local dm_name
+            dm_name=$(readlink -f "$device" 2>/dev/null | xargs basename 2>/dev/null || echo "unknown")
             local mountpoint
             mountpoint=$(lsblk -dn -o MOUNTPOINT "$device" 2>/dev/null || echo "")
+            local vendor
+            vendor=$(lsblk -dn -o VENDOR "$device" 2>/dev/null | tr -d ' ' || echo "N/A")
+            local model
+            model=$(lsblk -dn -o MODEL "$device" 2>/dev/null | tr -d ' ' || echo "N/A")
             
-            # Excluir devices já montados ou em uso
-            if [[ -z "$mountpoint" ]] && ! pvdisplay "$device" &>/dev/null; then
-                devices+=("$device - Tamanho: $size")
-                print_info "Encontrado device físico: $device ($size)"
+            # Verificar se é um device do sistema ou já está em uso
+            if [[ -z "$mountpoint" ]] && ! pvs "$device" &>/dev/null; then
+                local info="$device - Tamanho: $size"
+                [[ "$wwn" != "N/A" ]] && info+=" - WWN: $wwn"
+                [[ "$vendor" != "N/A" ]] && info+=" - Vendor: $vendor"
+                [[ "$model" != "N/A" ]] && info+=" - Model: $model"
+                [[ "$type" == "multipath" ]] && info+=" - DM: $dm_name"
+                
+                devices+=("$info")
+                print_info "Encontrado device $type: $info"
+            else
+                [[ -n "$mountpoint" ]] && print_warning "Device $device montado em $mountpoint"
+                pvs "$device" &>/dev/null && print_warning "Device $device já em uso como Physical Volume"
             fi
         fi
-    done
+    }
     
-    if [[ ${#devices[@]} -eq 0 ]]; then
-        print_error "Nenhum device disponível encontrado"
-        return 1
-    fi
-    
-    # Mostrar devices candidatos
-    print_info "Devices candidatos detectados:"
-    for i in "${!devices[@]}"; do
-        echo "$((i + 1)). ${devices[i]}"
-    done
-    
-    # Selecionar device automaticamente ou manualmente
-    local selected_device
-    if [[ ${#devices[@]} -eq 1 ]]; then
-        selected_device=$(echo "${devices[0]}" | awk '{print $1}')
-        print_info "Selecionando automaticamente único device: $selected_device"
-    else
-        echo ""
-        read -p "Selecione o device para criar VG compartilhado (número): " choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#devices[@]} ]]; then
-            selected_device=$(echo "${devices[$((choice - 1))]}" | awk '{print $1}')
-            print_info "Device selecionado: $selected_device"
-        else
-            print_error "Seleção inválida"
-            return 1
+    # Procurar por devices multipath
+    print_info "Procurando devices multipath..."
+    shopt -s nullglob
+    for device in /dev/mapper/* /dev/mpath/*; do
+        if [[ -b "$device" && "$device" != "/dev/mapper/control" && ! "$device" =~ ^/dev/mapper/dm-[0-9]+$ ]]; then
+            check_and_add_device "$device" "multipath"
         fi
-    fi
+    done
     
-    echo "$selected_device"
-    return 0
-}
+    # Procurar por LUNs em /dev/disk/by-id (especialmente wwn e scsi)
+    print_info "Procurando LUNs por WWN e SCSI ID..."
+    for device in /dev/disk/by-id/wwn-* /dev/disk/by-id/scsi-*; do
+        check_and_add_device "$device" "wwn/scsi"
+    done
+    
+    # Procurar por LUNs em /dev/disk/by-path
+    print_info "Procurando LUNs por path..."
+    for device in /dev/disk/by-path/*; do
+        if [[ "$device" =~ -lun- ]]; then
+            check_and_add_device "$device" "path"
+        fi
+    done
+    
+    # Procurar por devices físicos adequados (excluir disco do sistema)
+    print_info "Procurando devices físicos..."
+    for device in /dev/sd[b-z]; do
+        check_and_add_device "$device" "physical"
+    done
 
 configure_lvm_cluster() {
     print_header "⚙️  Configurando LVM para Cluster"
