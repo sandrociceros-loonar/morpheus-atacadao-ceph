@@ -3,6 +3,7 @@
 # ============================================================================
 # SCRIPT: setup-iscsi-lun.sh
 # DESCRIÇÃO: Configuração automática de conectividade iSCSI
+# VERSÃO: 2.5 - Versão Minimalista e Robusta
 # AUTOR: sandro.cicero@loonar.cloud
 # ============================================================================
 
