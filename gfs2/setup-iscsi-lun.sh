@@ -1,257 +1,640 @@
 #!/bin/bash
 
-################################################################################
-# Script: setup-iscsi-lun.sh
-# Descrição: Configuração completa de initiator iSCSI e multipath em nós do cluster
-#
-# FUNCIONALIDADES:
-# - Instala e configura open-iscsi e multipath-tools
-# - Conecta ao target iSCSI e configura sessões
-# - Configura multipath para device compartilhado
-# - Prepara device para uso em cluster GFS2
-# - Configura montagem automática
-#
-# PRÉ-REQUISITOS:
-# - VM com TGT (iSCSI Target) funcionando
-# - Target iSCSI disponível e acessível
-# - Conectividade de rede entre VMs
-#
-# USO:
-# Execute em AMBAS as VMs (fc-test1 e fc-test2)
-# sudo ./setup-iscsi-lun.sh
-#
-# VERSÃO: 1.0 - Script baseado na configuração desenvolvida
-################################################################################
+# ============================================================================
+# SCRIPT: setup-iscsi-lun.sh
+# DESCRIÇÃO: Configuração automática de conectividade iSCSI com discovery
+# VERSÃO: 2.0 - Discovery Automático e Configuração Enterprise
+# AUTOR: DevOps Team
+# ============================================================================
 
-function error_exit {
-    echo "❌ Erro: $1"
+# Configurações globais
+set -euo pipefail
+
+# Cores para output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Variáveis padrão
+readonly DEFAULT_TGT_IP="192.168.0.250"
+readonly ISCSI_PORT="3260"
+readonly MULTIPATH_ALIAS="fc-lun-cluster"
+
+# ============================================================================
+# FUNÇÕES AUXILIARES
+# ============================================================================
+
+print_header() {
+    echo -e "\n${BLUE}========================================================================${NC}"
+    echo -e "${BLUE}$1${NC}"
+    echo -e "${BLUE}========================================================================${NC}\n"
+}
+
+print_success() {
+    echo -e "${GREEN}✅ $1${NC}"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠️  $1${NC}"
+}
+
+print_error() {
+    echo -e "${RED}❌ $1${NC}"
+}
+
+print_info() {
+    echo -e "${BLUE}ℹ️  $1${NC}"
+}
+
+error_exit() {
+    print_error "$1"
     exit 1
 }
 
-function log_info {
-    echo "ℹ️  $1"
+# ============================================================================
+# DETECÇÃO E CONFIGURAÇÃO DE AMBIENTE
+# ============================================================================
+
+detect_node_info() {
+    local current_ip
+    current_ip=$(ip route get 8.8.8.8 2>/dev/null | awk '/src/ {print $7}' || echo "unknown")
+    
+    local hostname
+    hostname=$(hostname -s)
+    
+    echo "📋 Informações do nó detectadas:"
+    echo "   • Hostname: $hostname"
+    echo "   • IP: $current_ip"
+    echo ""
 }
 
-function log_success {
-    echo "✅ $1"
+check_prerequisites() {
+    print_header "🔍 Verificando Pré-requisitos do Sistema"
+    
+    # Verificar se é executado como root ou com sudo
+    if [[ $EUID -eq 0 ]]; then
+        print_warning "Script executado como root. Recomendado usar sudo."
+    fi
+    
+    # Verificar pacotes necessários
+    local required_packages=("open-iscsi" "multipath-tools" "lvm2")
+    local missing_packages=()
+    
+    for package in "${required_packages[@]}"; do
+        if ! dpkg -l | grep -q "^ii  $package "; then
+            missing_packages+=("$package")
+        fi
+    done
+    
+    if [[ ${#missing_packages[@]} -gt 0 ]]; then
+        print_warning "Pacotes ausentes: ${missing_packages[*]}"
+        print_info "Instalando pacotes necessários..."
+        
+        sudo apt update -qq
+        for package in "${missing_packages[@]}"; do
+            print_info "Instalando $package..."
+            if sudo apt install -y "$package" &>/dev/null; then
+                print_success "$package instalado com sucesso"
+            else
+                error_exit "Falha ao instalar $package"
+            fi
+        done
+    else
+        print_success "Todos os pacotes necessários estão instalados"
+    fi
+    
+    # Verificar serviços
+    print_info "Verificando serviços iSCSI..."
+    sudo systemctl enable open-iscsi &>/dev/null
+    sudo systemctl start open-iscsi &>/dev/null
+    
+    sudo systemctl enable multipath-tools &>/dev/null
+    sudo systemctl start multipath-tools &>/dev/null
+    
+    print_success "Pré-requisitos verificados"
+    return 0
 }
 
-function log_warning {
-    echo "⚠️  $1"
-}
+# ============================================================================
+# DISCOVERY AUTOMÁTICO DE TARGETS iSCSI
+# ============================================================================
 
-# Verificar se está rodando como root/sudo
-if [[ $EUID -ne 0 ]]; then
-   error_exit "Este script deve ser executado como root ou com sudo"
-fi
-
-echo "======================================================================"
-echo "🎯 Configuração de iSCSI Initiator e Multipath"
-echo "======================================================================"
-
-# Detectar hostname atual
-CURRENT_NODE=$(hostname)
-echo "Nó atual: $CURRENT_NODE"
-
-# === CONFIGURAÇÃO INTERATIVA ===
-echo ""
-log_info "Configuração do Target iSCSI..."
-
-# Solicitar informações do target
-read -p "IP do servidor iSCSI Target: " TARGET_IP
-if [ -z "$TARGET_IP" ]; then
-    error_exit "IP do target é obrigatório"
-fi
-
-read -p "IQN do target iSCSI (ex: iqn.2024-01.com.lab:target01): " TARGET_IQN
-if [ -z "$TARGET_IQN" ]; then
-    error_exit "IQN do target é obrigatório"
-fi
-
-# Verificar conectividade com o target
-log_info "Testando conectividade com $TARGET_IP..."
-if ! ping -c 2 "$TARGET_IP" &>/dev/null; then
-    log_warning "Target $TARGET_IP não responde ao ping. Continuando mesmo assim..."
-fi
-
-# === INSTALAÇÃO DE PACOTES ===
-log_info "Instalando pacotes necessários..."
-
-apt update || error_exit "Falha no apt update"
-apt install -y open-iscsi multipath-tools lvm2 || error_exit "Falha na instalação de pacotes"
-
-log_success "Pacotes instalados com sucesso"
-
-# === CONFIGURAÇÃO DO iSCSI INITIATOR ===
-log_info "Configurando iSCSI initiator..."
-
-# Iniciar e habilitar serviço iscsid
-systemctl enable --now iscsid
-systemctl enable --now open-iscsi
-
-# Verificar se serviços estão rodando
-if ! systemctl is-active --quiet iscsid; then
-    error_exit "Serviço iscsid não está ativo"
-fi
-
-log_success "Serviços iSCSI iniciados"
-
-# === DESCOBERTA E CONEXÃO DO TARGET ===
-log_info "Descobrindo targets iSCSI..."
-
-# Descobrir targets
-iscsiadm -m discovery -t sendtargets -p "$TARGET_IP" || error_exit "Falha na descoberta do target"
-
-# Conectar ao target específico
-log_info "Conectando ao target $TARGET_IQN..."
-iscsiadm -m node -T "$TARGET_IQN" -p "$TARGET_IP" --login || error_exit "Falha ao conectar ao target"
-
-# Configurar login automático
-iscsiadm -m node -T "$TARGET_IQN" -p "$TARGET_IP" --op update --name node.startup --value automatic
-
-log_success "Conectado ao target iSCSI com sucesso"
-
-# Verificar sessões ativas
-log_info "Verificando sessões iSCSI..."
-iscsiadm -m session
-
-# === CONFIGURAÇÃO DO MULTIPATH ===
-log_info "Configurando multipath..."
-
-# Iniciar e habilitar multipath
-systemctl enable --now multipathd
-
-# Aguardar estabilização
-sleep 3
-
-# Recarregar configuração multipath
-multipath -r
-
-# Verificar devices multipath
-log_info "Verificando devices multipath..."
-multipath -ll
-
-# === IDENTIFICAÇÃO DO DEVICE MULTIPATH ===
-log_info "Identificando device multipath criado..."
-
-# Aguardar criação do device
-sleep 5
-
-# Listar devices em /dev/mapper/
-echo "Devices multipath disponíveis:"
-ls -la /dev/mapper/ | grep -v control
-
-# Tentar identificar o device automaticamente
-MULTIPATH_DEVICE=""
-for device in /dev/mapper/*; do
-    if [ "$device" != "/dev/mapper/control" ] && [ -e "$device" ]; then
-        # Verificar se é um device de bloco válido
-        if [ -b "$device" ]; then
-            MULTIPATH_DEVICE="$device"
-            break
+discover_iscsi_targets() {
+    local tgt_ip="${1:-$DEFAULT_TGT_IP}"
+    
+    print_header "🔍 Discovery Automático de Targets iSCSI"
+    
+    print_info "Verificando conectividade com servidor iSCSI..."
+    if ! ping -c 2 "$tgt_ip" &>/dev/null; then
+        print_error "Não foi possível conectar com o servidor iSCSI: $tgt_ip"
+        print_info "Verifique conectividade de rede ou informe IP correto"
+        return 1
+    fi
+    
+    print_success "Conectividade com $tgt_ip verificada"
+    
+    print_info "Descobrindo targets iSCSI disponíveis em $tgt_ip:$ISCSI_PORT..."
+    
+    # Limpar descobertas anteriores
+    sudo iscsiadm -m discovery -o delete 2>/dev/null || true
+    
+    # Discovery dos targets disponíveis
+    local discovery_output
+    if ! discovery_output=$(sudo iscsiadm -m discovery -t st -p "$tgt_ip:$ISCSI_PORT" 2>/dev/null); then
+        print_error "Falha no discovery de targets iSCSI"
+        print_info "Possíveis causas:"
+        echo "   • Servidor iSCSI não está rodando"
+        echo "   • Firewall bloqueando porta $ISCSI_PORT"
+        echo "   • IP incorreto: $tgt_ip"
+        return 1
+    fi
+    
+    if [[ -z "$discovery_output" ]]; then
+        print_error "Nenhum target iSCSI encontrado em $tgt_ip"
+        return 1
+    fi
+    
+    print_success "Targets iSCSI descobertos:"
+    echo ""
+    
+    local target_count=0
+    local selected_target=""
+    local targets_info=()
+    
+    # Processar output do discovery
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            local portal=$(echo "$line" | awk '{print $1}')
+            local iqn=$(echo "$line" | awk '{print $2}')
+            
+            ((target_count++))
+            targets_info+=("$portal|$iqn")
+            
+            echo "   $target_count. Portal: $portal"
+            echo "      IQN: $iqn"
+            echo ""
+        fi
+    done <<< "$discovery_output"
+    
+    # Seleção automática ou manual do target
+    if [[ $target_count -eq 1 ]]; then
+        selected_target="${targets_info[0]}"
+        local iqn=$(echo "$selected_target" | cut -d'|' -f2)
+        print_info "Selecionando automaticamente único target disponível:"
+        print_success "IQN: $iqn"
+    else
+        echo ""
+        read -p "Selecione o target desejado (número): " choice
+        
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le $target_count ]]; then
+            selected_target="${targets_info[$((choice - 1))]}"
+            local iqn=$(echo "$selected_target" | cut -d'|' -f2)
+            print_success "Target selecionado: $iqn"
+        else
+            print_error "Seleção inválida"
+            return 1
         fi
     fi
-done
-
-if [ -n "$MULTIPATH_DEVICE" ]; then
-    log_success "Device multipath detectado: $MULTIPATH_DEVICE"
-else
-    log_warning "Device multipath não detectado automaticamente"
-    echo "Devices disponíveis em /dev/mapper/:"
-    ls -la /dev/mapper/
-    read -p "Digite o caminho completo do device multipath: " MULTIPATH_DEVICE
     
-    if [ ! -e "$MULTIPATH_DEVICE" ]; then
-        error_exit "Device $MULTIPATH_DEVICE não existe"
+    # Retornar informações do target selecionado
+    echo "$selected_target"
+    return 0
+}
+
+# ============================================================================
+# CONFIGURAÇÃO iSCSI
+# ============================================================================
+
+configure_iscsi_initiator() {
+    print_header "🔧 Configurando iSCSI Initiator"
+    
+    # Gerar InitiatorName único baseado no hostname
+    local hostname=$(hostname -s)
+    local initiator_name="iqn.2004-10.com.ubuntu:01:$(openssl rand -hex 6):$hostname"
+    
+    print_info "Configurando InitiatorName..."
+    echo "InitiatorName=$initiator_name" | sudo tee /etc/iscsi/initiatorname.iscsi > /dev/null
+    
+    print_success "InitiatorName configurado: $initiator_name"
+    
+    # Configurar parâmetros iSCSI
+    print_info "Configurando parâmetros iSCSI..."
+    
+    # Configurações para ambiente de laboratório
+    sudo tee /etc/iscsi/iscsid.conf > /dev/null << 'EOF'
+# Configuração otimizada para cluster GFS2
+node.startup = automatic
+node.leading_login = No
+
+# Configurações de timeout
+node.session.timeo.replacement_timeout = 120
+node.conn[0].timeo.login_timeout = 15
+node.conn[0].timeo.logout_timeout = 15
+node.conn[0].timeo.noop_out_interval = 5
+node.conn[0].timeo.noop_out_timeout = 5
+
+# Configurações de retry
+node.session.err_timeo.abort_timeout = 15
+node.session.err_timeo.lu_reset_timeout = 30
+node.session.err_timeo.tgt_reset_timeout = 30
+
+# Queue depth
+node.session.queue_depth = 32
+
+# Configurações de autenticação (desabilitada para laboratório)
+node.session.auth.authmethod = None
+discovery.sendtargets.auth.authmethod = None
+EOF
+    
+    print_success "Configurações iSCSI aplicadas"
+    
+    # Reiniciar serviços
+    print_info "Reiniciando serviços iSCSI..."
+    sudo systemctl restart open-iscsi
+    sudo systemctl restart iscsid
+    
+    sleep 3
+    
+    print_success "Serviços iSCSI reiniciados"
+    return 0
+}
+
+connect_to_target() {
+    local target_info="$1"
+    local portal=$(echo "$target_info" | cut -d'|' -f1)
+    local iqn=$(echo "$target_info" | cut -d'|' -f2)
+    
+    print_header "🔗 Conectando ao Target iSCSI"
+    
+    print_info "Conectando ao target:"
+    echo "   • Portal: $portal"
+    echo "   • IQN: $iqn"
+    
+    # Fazer login no target
+    if sudo iscsiadm -m node -T "$iqn" -p "$portal" --login; then
+        print_success "Conexão estabelecida com sucesso"
+    else
+        print_error "Falha na conexão com o target"
+        return 1
     fi
-fi
+    
+    # Aguardar dispositivos serem detectados
+    print_info "Aguardando detecção de dispositivos (10s)..."
+    sleep 10
+    
+    # Verificar dispositivos detectados
+    local devices=$(lsblk -dn | grep disk | grep -v -E "(loop|sr)" || true)
+    if [[ -n "$devices" ]]; then
+        print_success "Dispositivos detectados:"
+        echo "$devices" | while read -r device; do
+            echo "   • $device"
+        done
+    else
+        print_warning "Nenhum dispositivo novo detectado"
+    fi
+    
+    return 0
+}
 
-# === CONFIGURAÇÃO DE ALIAS MULTIPATH ===
-log_info "Configurando alias multipath..."
+# ============================================================================
+# CONFIGURAÇÃO MULTIPATH
+# ============================================================================
 
-# Criar configuração multipath com alias
-MULTIPATH_CONF="/etc/multipath.conf"
-DEVICE_WWID=$(multipath -ll | grep -A 1 "$MULTIPATH_DEVICE" | grep -o '[0-9a-f]\{32\}' | head -1)
+configure_multipath() {
+    print_header "🛣️  Configurando Multipath"
+    
+    print_info "Verificando dispositivos iSCSI..."
+    
+    # Detectar dispositivos iSCSI
+    local iscsi_devices=($(lsscsi | grep -E "(IET|LIO|SCST)" | awk '{print $6}' | grep -v '^$' || true))
+    
+    if [[ ${#iscsi_devices[@]} -eq 0 ]]; then
+        print_error "Nenhum dispositivo iSCSI detectado"
+        print_info "Verifique se a conexão iSCSI foi estabelecida corretamente"
+        return 1
+    fi
+    
+    print_success "Dispositivos iSCSI detectados:"
+    for device in "${iscsi_devices[@]}"; do
+        local size=$(lsblk -dn -o SIZE "$device" 2>/dev/null || echo "N/A")
+        echo "   • $device (Tamanho: $size)"
+    done
+    
+    # Obter WWID para configuração multipath
+    local primary_device="${iscsi_devices[0]}"
+    local wwid
+    if wwid=$(sudo /lib/udev/scsi_id -g -u -d "$primary_device" 2>/dev/null); then
+        print_success "WWID detectado: $wwid"
+    else
+        print_error "Falha ao obter WWID do dispositivo"
+        return 1
+    fi
+    
+    print_info "Configurando multipath.conf..."
+    
+    # Criar configuração multipath
+    sudo tee /etc/multipath.conf > /dev/null << EOF
+# Configuração Multipath para Cluster GFS2
+defaults {
+    user_friendly_names yes
+    find_multipaths yes
+    enable_foreign "^$"
+    
+    # Configurações para ambiente de cluster
+    checker_timeout 60
+    max_polling_interval 20
+    
+    # Configurações de path failure
+    dev_loss_tmo infinity
+    fast_io_fail_tmo 5
+}
 
-if [ -n "$DEVICE_WWID" ]; then
-    cat >> "$MULTIPATH_CONF" << EOF
+blacklist {
+    # Blacklist dispositivos locais comuns
+    devnode "^(ram|raw|loop|fd|md|dm-|sr|scd|st)[0-9]*"
+    devnode "^hd[a-z]"
+    devnode "^cciss!c[0-9]d[0-9]*"
+    
+    # Blacklist por tipo de dispositivo
+    device {
+        vendor "ATA"
+    }
+    device {
+        vendor "QEMU"
+        product "QEMU HARDDISK"
+    }
+}
 
-# Configuração para LUN do cluster
 multipaths {
     multipath {
-        wwid $DEVICE_WWID
-        alias fc-lun-cluster
+        wwid $wwid
+        alias $MULTIPATH_ALIAS
+        path_grouping_policy multibus
+        path_checker tur
+        failback immediate
+        rr_weight priorities
+        no_path_retry queue
+        rr_min_io 100
+    }
+}
+
+# Configurações específicas para iSCSI
+devices {
+    device {
+        vendor "IET"
+        product "VIRTUAL-DISK"
+        path_grouping_policy multibus
+        path_checker tur
+        features "0"
+        hardware_handler "0"
+        prio const
+        rr_weight uniform
+        rr_min_io 1
+        flush_on_last_del yes
+        dev_loss_tmo infinity
+        fast_io_fail_tmo 5
     }
 }
 EOF
     
-    # Recarregar configuração
-    systemctl reload multipathd
-    multipath -r
+    print_success "multipath.conf configurado"
     
-    # Aguardar criação do alias
-    sleep 3
+    # Reiniciar e configurar multipath
+    print_info "Configurando serviço multipath..."
     
-    if [ -e "/dev/mapper/fc-lun-cluster" ]; then
-        MULTIPATH_DEVICE="/dev/mapper/fc-lun-cluster"
-        log_success "Alias fc-lun-cluster configurado com sucesso"
+    sudo systemctl enable multipathd
+    sudo systemctl restart multipathd
+    
+    # Aguardar multipath processar
+    sleep 5
+    
+    # Forçar recriação de mapas
+    sudo multipath -F
+    sudo multipath -r
+    
+    sleep 5
+    
+    # Verificar se alias foi criado
+    if ls /dev/mapper/$MULTIPATH_ALIAS &>/dev/null; then
+        local device_info=$(sudo multipath -ll $MULTIPATH_ALIAS 2>/dev/null || echo "Informação não disponível")
+        print_success "Dispositivo multipath criado: /dev/mapper/$MULTIPATH_ALIAS"
+        echo ""
+        print_info "Informações do dispositivo multipath:"
+        echo "$device_info"
+    else
+        print_error "Falha ao criar dispositivo multipath"
+        print_info "Tentando criar manualmente..."
+        
+        # Tentar criar mapa multipath manualmente
+        sudo multipath -a "$primary_device"
+        sudo multipath -r
+        sleep 5
+        
+        if ls /dev/mapper/$MULTIPATH_ALIAS &>/dev/null; then
+            print_success "Dispositivo multipath criado manualmente"
+        else
+            print_error "Falha na criação do dispositivo multipath"
+            return 1
+        fi
     fi
-fi
+    
+    return 0
+}
 
-# === VERIFICAÇÃO DO DEVICE ===
-log_info "Verificando acessibilidade do device..."
+# ============================================================================
+# VALIDAÇÃO E TESTES
+# ============================================================================
 
-# Testar leitura do device
-if dd if="$MULTIPATH_DEVICE" of=/dev/null bs=4096 count=1 &>/dev/null; then
-    log_success "Device $MULTIPATH_DEVICE está acessível"
-else
-    error_exit "Device $MULTIPATH_DEVICE não está acessível"
-fi
+validate_configuration() {
+    print_header "🔍 Validando Configuração iSCSI/Multipath"
+    
+    # Verificar conectividade iSCSI
+    print_info "Verificando sessões iSCSI ativas..."
+    local iscsi_sessions=$(sudo iscsiadm -m session 2>/dev/null | wc -l)
+    
+    if [[ $iscsi_sessions -gt 0 ]]; then
+        print_success "$iscsi_sessions sessões iSCSI ativas"
+        sudo iscsiadm -m session | while read -r session; do
+            echo "   • $session"
+        done
+    else
+        print_error "Nenhuma sessão iSCSI ativa"
+        return 1
+    fi
+    
+    echo ""
+    
+    # Verificar dispositivo multipath
+    print_info "Verificando dispositivo multipath..."
+    
+    if [[ -b "/dev/mapper/$MULTIPATH_ALIAS" ]]; then
+        local size=$(lsblk -dn -o SIZE "/dev/mapper/$MULTIPATH_ALIAS")
+        print_success "Dispositivo multipath acessível: /dev/mapper/$MULTIPATH_ALIAS ($size)"
+        
+        # Testar acesso de leitura
+        if sudo dd if="/dev/mapper/$MULTIPATH_ALIAS" of=/dev/null bs=4k count=1 &>/dev/null; then
+            print_success "Teste de leitura no dispositivo: OK"
+        else
+            print_error "Falha no teste de leitura do dispositivo"
+            return 1
+        fi
+        
+    else
+        print_error "Dispositivo multipath não está acessível"
+        return 1
+    fi
+    
+    echo ""
+    
+    # Verificar multipath status
+    print_info "Status detalhado do multipath:"
+    sudo multipath -ll "$MULTIPATH_ALIAS" 2>/dev/null || {
+        print_warning "Não foi possível obter status detalhado do multipath"
+    }
+    
+    return 0
+}
 
-# Obter tamanho do device
-DEVICE_SIZE=$(lsblk -b -d -o SIZE "$MULTIPATH_DEVICE" 2>/dev/null)
-if [ -n "$DEVICE_SIZE" ]; then
-    DEVICE_SIZE_GB=$((DEVICE_SIZE / 1024 / 1024 / 1024))
-    log_info "Tamanho do device: ${DEVICE_SIZE_GB}GB"
-fi
+test_device_performance() {
+    print_info "Executando teste básico de performance..."
+    
+    local test_file="/tmp/iscsi_performance_test"
+    local device="/dev/mapper/$MULTIPATH_ALIAS"
+    
+    # Teste de escrita (pequeno para não impactar)
+    if timeout 30s sudo dd if=/dev/zero of="$device" bs=1M count=10 oflag=direct 2>/tmp/dd_test.log; then
+        local write_speed=$(grep -oE '[0-9.]+ [MG]B/s' /tmp/dd_test.log | tail -n1)
+        print_success "Teste de escrita: $write_speed"
+    else
+        print_warning "Teste de escrita não concluído"
+    fi
+    
+    # Teste de leitura
+    if timeout 30s sudo dd if="$device" of=/dev/null bs=1M count=10 iflag=direct 2>/tmp/dd_test.log; then
+        local read_speed=$(grep -oE '[0-9.]+ [MG]B/s' /tmp/dd_test.log | tail -n1)
+        print_success "Teste de leitura: $read_speed"
+    else
+        print_warning "Teste de leitura não concluído"
+    fi
+    
+    # Limpeza
+    sudo rm -f /tmp/dd_test.log "$test_file" 2>/dev/null || true
+}
 
-# === CONFIGURAÇÃO FINAL ===
-echo ""
-echo "======================================================================"
-echo "✅ CONFIGURAÇÃO CONCLUÍDA COM SUCESSO!"
-echo "======================================================================"
+# ============================================================================
+# FUNÇÃO PRINCIPAL
+# ============================================================================
 
-echo ""
-echo "📋 RESUMO DA CONFIGURAÇÃO:"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Nó atual:            $CURRENT_NODE"
-echo "Target IP:           $TARGET_IP"
-echo "Target IQN:          $TARGET_IQN"
-echo "Device multipath:    $MULTIPATH_DEVICE"
-if [ -n "$DEVICE_SIZE_GB" ]; then
-echo "Tamanho da LUN:      ${DEVICE_SIZE_GB}GB"
-fi
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+main() {
+    print_header "🚀 Setup iSCSI LUN - Configuração Automática"
+    
+    local tgt_ip="${1:-$DEFAULT_TGT_IP}"
+    
+    print_info "Iniciando configuração iSCSI/Multipath..."
+    print_info "Servidor iSCSI Target: $tgt_ip"
+    
+    # Detectar informações do nó
+    detect_node_info
+    
+    # Verificar pré-requisitos
+    if ! check_prerequisites; then
+        error_exit "Falha na verificação de pré-requisitos"
+    fi
+    
+    # Discovery automático de targets
+    local target_info
+    if ! target_info=$(discover_iscsi_targets "$tgt_ip"); then
+        error_exit "Falha no discovery de targets iSCSI"
+    fi
+    
+    # Configurar initiator iSCSI
+    if ! configure_iscsi_initiator; then
+        error_exit "Falha na configuração do initiator iSCSI"
+    fi
+    
+    # Conectar ao target
+    if ! connect_to_target "$target_info"; then
+        error_exit "Falha na conexão com o target iSCSI"
+    fi
+    
+    # Configurar multipath
+    if ! configure_multipath; then
+        error_exit "Falha na configuração do multipath"
+    fi
+    
+    # Validar configuração
+    if ! validate_configuration; then
+        error_exit "Falha na validação da configuração"
+    fi
+    
+    # Teste de performance (opcional)
+    read -p "Executar teste básico de performance? [s/N]: " run_test
+    if [[ "$run_test" == "s" || "$run_test" == "S" ]]; then
+        test_device_performance
+    fi
+    
+    # Relatório final
+    print_header "✅ Configuração iSCSI/Multipath Concluída"
+    
+    echo ""
+    print_success "🎯 Resumo da Configuração:"
+    
+    local target_iqn=$(echo "$target_info" | cut -d'|' -f2)
+    print_info "   • Target IQN: $target_iqn"
+    print_info "   • Servidor: $tgt_ip:$ISCSI_PORT"
+    print_info "   • Dispositivo multipath: /dev/mapper/$MULTIPATH_ALIAS"
+    print_info "   • Tamanho: $(lsblk -dn -o SIZE "/dev/mapper/$MULTIPATH_ALIAS" 2>/dev/null || echo "N/A")"
+    
+    echo ""
+    print_success "📋 Próximos Passos:"
+    print_info "   1. Execute este script no outro nó do cluster"
+    print_info "   2. Configure cluster Pacemaker/Corosync"
+    print_info "   3. Execute: install-lun-prerequisites.sh"
+    print_info "   4. Configure GFS2 com: configure-lun-multipath.sh"
+    
+    echo ""
+    print_info "🔧 Comandos úteis:"
+    print_info "   • Verificar sessões: sudo iscsiadm -m session"
+    print_info "   • Status multipath: sudo multipath -ll"
+    print_info "   • Dispositivo: ls -la /dev/mapper/$MULTIPATH_ALIAS"
+    
+    print_success "🎉 Setup iSCSI concluído com sucesso!"
+}
 
-echo ""
-echo "🔍 COMANDOS DE VERIFICAÇÃO:"
-echo "iscsiadm -m session                   # Verificar sessões iSCSI"
-echo "multipath -ll                         # Status do multipath"
-echo "lsblk | grep -E '(fc-lun|dm-)'        # Listar devices relacionados"
+# ============================================================================
+# EXECUÇÃO
+# ============================================================================
 
-echo ""
-echo "⚠️  PRÓXIMOS PASSOS:"
-echo "1. Execute este script no OUTRO nó do cluster também"
-echo "2. Depois execute o script install-lun-prerequisites.sh em ambos os nós"
-echo "3. Configure o cluster GFS2 com configure-lun-multipath.sh"
-echo "4. Teste a sincronização com test-lun-gfs2.sh"
-
-echo ""
-echo "💡 INFORMAÇÕES IMPORTANTES:"
-echo "- O device $MULTIPATH_DEVICE agora está disponível para uso em cluster"
-echo "- O login iSCSI foi configurado como automático"
-echo "- O multipath está ativo e monitorando o device"
-echo "- Execute o mesmo script no outro nó para configuração completa"
-
-echo ""
-log_success "Setup do iSCSI initiator concluído no nó $CURRENT_NODE!"
+# Verificar argumentos
+case "${1:-}" in
+    --help|-h)
+        echo "Uso: $0 [IP_DO_SERVIDOR_TGT]"
+        echo ""
+        echo "Configuração automática de conectividade iSCSI com discovery automático"
+        echo ""
+        echo "Parâmetros:"
+        echo "  IP_DO_SERVIDOR_TGT    IP do servidor iSCSI Target (padrão: $DEFAULT_TGT_IP)"
+        echo ""
+        echo "Exemplos:"
+        echo "  $0                    # Usar IP padrão ($DEFAULT_TGT_IP)"
+        echo "  $0 192.168.1.100      # Usar IP específico"
+        echo ""
+        echo "Este script:"
+        echo "  • Descobre automaticamente targets iSCSI disponíveis"
+        echo "  • Configura initiator iSCSI com parâmetros otimizados"
+        echo "  • Estabelece conexão com o target selecionado"
+        echo "  • Configura multipath com alias personalizado"
+        echo "  • Valida configuração e testa acesso ao dispositivo"
+        exit 0
+        ;;
+    --version)
+        echo "setup-iscsi-lun.sh versão 2.0 - Discovery Automático"
+        exit 0
+        ;;
+    *)
+        # Execução normal
+        main "$@"
+        ;;
+esac
