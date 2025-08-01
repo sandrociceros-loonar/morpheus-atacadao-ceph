@@ -115,8 +115,12 @@ echo "Criando arquivo de configuração iSCSI..."
 # Primeiro, criar um arquivo mínimo para teste
 sudo tee /etc/iscsi/iscsid.conf >/dev/null <<EOF
 node.startup = automatic
+node.session.auth.authmethod = CHAP
 node.session.auth.authmethod = None
 node.session.timeo.replacement_timeout = 120
+node.conn.timeo.login_timeout = 15
+node.conn.timeo.logout_timeout = 15
+node.session.initial_login_retry_max = 8
 EOF
 
 # Verificar a configuração mínima
