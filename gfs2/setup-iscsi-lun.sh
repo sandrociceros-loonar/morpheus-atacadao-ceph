@@ -2,7 +2,8 @@
 
 # ============================================================================
 # SCRIPT: setup-iscsi-lun.sh
-# VERSÃO: FINAL - Solução Definitiva
+# DESCRIÇÃO: Configuração automática de conectividade iSCSI - Versão Completa
+# VERSÃO: FINAL - Com limpeza de sessões existentes
 # AUTOR: sandro.cicero@loonar.cloud
 # ============================================================================
 
@@ -13,6 +14,14 @@ DEFAULT_TGT_IP="192.168.0.250"
 MULTIPATH_ALIAS="fc-lun-cluster"
 
 echo "Configurando iSCSI/Multipath..."
+
+# CORREÇÃO: Limpar sessões existentes primeiro
+echo "Limpando sessões iSCSI existentes..."
+sudo iscsiadm -m node --logoutall=all >/dev/null 2>&1 || true
+sudo iscsiadm -m discoverydb -o delete >/dev/null 2>&1 || true
+sudo iscsiadm -m node -o delete >/dev/null 2>&1 || true
+sudo systemctl restart open-iscsi iscsid
+sleep 5
 
 # Informações básicas do nó
 HOSTNAME=$(hostname -s)
@@ -60,12 +69,11 @@ node.session.queue_depth = 32
 EOF
 
 # Reiniciar serviços iSCSI
-sudo systemctl enable --now open-iscsi iscsid >/dev/null 2>&1
+sudo systemctl restart open-iscsi iscsid
 sleep 3
 
 # Discovery de targets
 echo "Descobrindo targets..."
-sudo iscsiadm -m discovery -o delete >/dev/null 2>&1 || true
 DISCOVERY=$(sudo iscsiadm -m discovery -t st -p "$TARGET_IP:3260" 2>/dev/null || echo "")
 
 if [[ -z "$DISCOVERY" ]]; then
@@ -77,14 +85,13 @@ fi
 echo "Conectando aos targets..."
 CONNECTED=0
 
-# Salvar discovery em arquivo temporário para processamento simples
+# Salvar discovery em arquivo temporário
 echo "$DISCOVERY" > /tmp/iscsi_targets.txt
 
 # Processar cada linha do arquivo
 while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     
-    # Extrair portal e IQN usando awk
     PORTAL=$(echo "$line" | awk '{print $1}')
     IQN=$(echo "$line" | awk '{print $2}')
     
@@ -101,7 +108,6 @@ while IFS= read -r line; do
     
 done < /tmp/iscsi_targets.txt
 
-# Limpar arquivo temporário
 rm -f /tmp/iscsi_targets.txt
 
 if [[ $CONNECTED -eq 0 ]]; then
@@ -225,10 +231,27 @@ if [[ -b "/dev/mapper/$MULTIPATH_ALIAS" ]]; then
         echo "   Teste de leitura: OK"
     fi
     
+    # Configurar auto-start
+    sudo systemctl enable open-iscsi multipathd >/dev/null 2>&1
+    
+    # Status final
+    echo ""
+    echo "📋 Status final:"
+    echo "   InitiatorName: $INITIATOR"
+    echo "   WWID: $WWID"
+    echo "   Multipath status:"
+    sudo multipath -ll "$MULTIPATH_ALIAS" 2>/dev/null || echo "   Status não disponível"
+    
 else
     echo "ERRO: Dispositivo /dev/mapper/$MULTIPATH_ALIAS não foi criado"
     echo "Debug info:"
     echo "  Mapas multipath: $(sudo multipath -ll 2>/dev/null | wc -l)"
     echo "  Dispositivos /dev/mapper: $(ls /dev/mapper/ | grep -v control | wc -l)"
+    echo "  Sessões iSCSI: $(sudo iscsiadm -m session 2>/dev/null | wc -l)"
+    echo ""
+    echo "Comandos de diagnóstico:"
+    echo "  sudo multipath -ll"
+    echo "  sudo iscsiadm -m session"
+    echo "  lsscsi | grep IET"
     exit 1
 fi
