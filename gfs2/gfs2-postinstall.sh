@@ -11,10 +11,10 @@ DEBIAN_FRONTEND=noninteractive apt install -y \
   gfs2-utils dlm-controld pcs \
   pacemaker corosync
 
-echo "=== 2. Configurar multipath para Fibre Channel ==="
+echo "=== 2. Configurar multipath para Fibre Channel (preservar WWID) ==="
 cat > /etc/multipath.conf <<'EOF'
 defaults {
-    user_friendly_names yes
+    user_friendly_names no
     find_multipaths yes
     enable_foreign "^$"
 }
@@ -38,12 +38,12 @@ devices {
     }
 }
 EOF
+
 systemctl restart multipath-tools
 multipath -F
 multipath -r
 
 echo "=== 3. Habilitar e iniciar serviços de cluster ==="
-echo "Definindo senha do usuário 'hacluster' (ajuste conforme política)..."
 echo "hacluster:clusterPass1" | chpasswd
 
 systemctl enable --now pcsd
@@ -62,13 +62,7 @@ systemctl daemon-reload
 systemctl enable dlm
 systemctl restart dlm
 
-echo "=== 5. Configurar DLM_DEFAULTS opcionalmente ==="
-cat > /etc/default/dlm <<'EOF'
-# Arquivo de configuração do DLM (sem -T)
-# Sem opções adicionais necessárias para Ubuntu 22.04+
-EOF
-
-echo "=== 6. Verificações Finais ==="
+echo "=== 5. Verificações Finais ==="
 echo "Status dos serviços:"
 systemctl is-active corosync pacemaker dlm multipath-tools
 
@@ -77,5 +71,8 @@ echo "Dispositivos multipath detectados:"
 multipath -ll
 
 echo
-echo "Verifique o status do cluster (após formar quorum):"
-echo "  crm status  # requer configuração de fencing e quorum via pcs"
+echo "Reiniciando agente Morpheus..."
+systemctl restart morpheus-agent
+
+echo
+echo "Verifique no Morpheus a listagem do bloco /dev/mapper/<WWID> e crie o datastore GFS2."
