@@ -1,10 +1,10 @@
 #!/bin/bash
 # ============================================================================
 # SCRIPT: test-vgcluster.sh
-# DESCRIÇÃO: Testa o bloqueio DLM no VG 'vg_cluster'
-#            - Inicia e habilita o serviço correto de lockd (lvm2-lockd ou lvmlockd)
-#            - Verifica status do serviço
-#            - Exibe logs recentes
+# DESCRIÇÃO: Testa bloqueio DLM em /dev/vg_cluster
+#            - Carrega módulos e inicia manualmente dlm_controld e lvmlockd
+#            - Verifica processos
+#            - Exibe logs de processos
 #            - Testa vgchange --lockstart e exibe LockType
 # USO: sudo ./test-vgcluster.sh
 # ============================================================================
@@ -12,60 +12,54 @@
 set -euo pipefail
 
 VG="vg_cluster"
-SERVICES=(lvm2-lockd lvmlockd)
 
 print_header() {
-  echo
-  echo "=== $1 ==="
-  echo
+  echo; echo "=== $1 ==="; echo
 }
+print_success() { echo "[OK]    $1"; }
+print_error()   { echo "[FAIL]  $1"; }
 
-print_success() {
-  echo "[OK]    $1"
-}
-
-print_error() {
-  echo "[FAIL]  $1"
-}
-
-# 1) Encontrar e iniciar serviço de lockd
-print_header "1) Iniciando serviço de lockd"
-LOCKD_SERVICE=""
-for svc in "${SERVICES[@]}"; do
-  if systemctl list-unit-files | grep -q "^${svc}.service"; then
-    LOCKD_SERVICE="${svc}.service"
-    break
-  fi
-done
-
-if [[ -z "$LOCKD_SERVICE" ]]; then
-  print_error "Nenhum serviço de lockd encontrado (lvm2-lockd.service ou lvmlockd.service)"
-  exit 1
+# 1) Carregar e iniciar dlm_controld
+print_header "1) Carregando e iniciando dlm_controld"
+sudo modprobe dlm
+if pgrep -x dlm_controld &>/dev/null; then
+  print_success "dlm_controld já em execução"
+else
+  sudo dlm_controld --syslog
+  sleep 2
+  pgrep -x dlm_controld &>/dev/null && print_success "dlm_controld iniciado" || { print_error "Falha ao iniciar dlm_controld"; exit 1; }
 fi
 
-sudo systemctl enable --now "$LOCKD_SERVICE" \
-  && print_success "$LOCKD_SERVICE habilitado e iniciado" \
-  || { print_error "Falha ao iniciar $LOCKD_SERVICE"; exit 1; }
+# 2) Carregar e iniciar lvmlockd
+print_header "2) Iniciando lvmlockd"
+if pgrep -x lvmlockd &>/dev/null; then
+  print_success "lvmlockd já em execução"
+else
+  sudo lvmlockd --syslog
+  sleep 2
+  pgrep -x lvmlockd &>/dev/null && print_success "lvmlockd iniciado" || { print_error "Falha ao iniciar lvmlockd"; exit 1; }
+fi
 
-# 2) Verificar status
-print_header "2) Status de $LOCKD_SERVICE"
-systemctl status "$LOCKD_SERVICE" --no-pager -n0 || print_error "Serviço não ativo"
+# 3) Verificar processos
+print_header "3) Verificando processos"
+ps -C dlm_controld,lvmlockd -o pid,cmd
 
-# 3) Logs recentes
-print_header "3) Logs do journalctl para $LOCKD_SERVICE"
-journalctl -u "$LOCKD_SERVICE" -n 50 --no-pager
+# 4) Exibir logs de systemd (últimos 50) de dlm e lvmlockd
+print_header "4) Logs do journalctl para dlm_controld e lvmlockd"
+journalctl -t dlm_controld -n 50 --no-pager || true
+journalctl -t lvmlockd    -n 50 --no-pager || true
 
-# 4) Testar vgchange lockstart
-print_header "4) Testando vgchange --lockstart $VG"
+# 5) Testar vgchange lockstart
+print_header "5) Testando vgchange --lockstart $VG"
 if sudo vgchange --lockstart "$VG"; then
-  print_success "vgchange --lockstart $VG executado com sucesso"
+  print_success "vgchange --lockstart $VG executado"
 else
   print_error "Falha ao executar vgchange --lockstart $VG"
   exit 1
 fi
 
-# 5) Exibir LockType do VG
-print_header "5) Exibindo LockType do VG"
+# 6) Exibir LockType do VG
+print_header "6) Exibindo LockType do VG"
 sudo vgs --all -o vg_name,lock_type
 
 print_header "Teste de vg_cluster concluído"
