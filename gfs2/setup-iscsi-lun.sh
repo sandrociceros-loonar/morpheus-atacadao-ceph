@@ -2,8 +2,7 @@
 
 # ============================================================================
 # SCRIPT: setup-iscsi-lun.sh
-# DESCRIÇÃO: Configuração automática de conectividade iSCSI - Versão Completa
-# VERSÃO: FINAL - Com limpeza de sessões existentes
+# VERSÃO: DEFINITIVA - Resolve Race Condition
 # AUTOR: sandro.cicero@loonar.cloud
 # ============================================================================
 
@@ -13,21 +12,43 @@ set -e
 DEFAULT_TGT_IP="192.168.0.250"
 MULTIPATH_ALIAS="fc-lun-cluster"
 
-echo "Configurando iSCSI/Multipath..."
+echo "Configurando iSCSI/Multipath - Versão Definitiva..."
 
-# CORREÇÃO: Limpar sessões existentes primeiro
-echo "Limpando sessões iSCSI existentes..."
-sudo iscsiadm -m node --logoutall=all >/dev/null 2>&1 || true
-sudo iscsiadm -m discoverydb -o delete >/dev/null 2>&1 || true
-sudo iscsiadm -m node -o delete >/dev/null 2>&1 || true
-sudo systemctl restart open-iscsi iscsid
-sleep 5
+# Função para aguardar iscsid estar pronto
+wait_for_iscsid() {
+    echo "Aguardando iscsid estar completamente operacional..."
+    local max_attempts=30
+    local attempt=1
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        # Testar se iscsiadm consegue se comunicar com iscsid
+        if sudo iscsiadm -m session >/dev/null 2>&1; then
+            echo "✅ iscsid está operacional (tentativa $attempt)"
+            return 0
+        fi
+        
+        echo "Aguardando iscsid... ($attempt/$max_attempts)"
+        sleep 2
+        ((attempt++))
+    done
+    
+    echo "❌ ERRO: iscsid não ficou operacional após $max_attempts tentativas"
+    return 1
+}
 
-# Informações básicas do nó
+# Limpar estado anterior
+echo "Limpando estado iSCSI anterior..."
+sudo systemctl stop open-iscsi || true
+sudo systemctl stop iscsid || true
+sudo pkill -f iscsid || true
+sleep 3
+
+# Informações básicas
 HOSTNAME=$(hostname -s)
 CURRENT_IP=$(ip route get 8.8.8.8 2>/dev/null | awk '/src/ {print $7}' || echo "unknown")
+echo "Sistema: $HOSTNAME ($CURRENT_IP)"
 
-# Instalar pacotes necessários
+# Instalar pacotes se necessário
 for pkg in open-iscsi multipath-tools lvm2; do
     if ! dpkg -l | grep -q "^ii  $pkg "; then
         echo "Instalando $pkg..."
@@ -41,13 +62,10 @@ NETWORK=$(echo $CURRENT_IP | cut -d. -f1-3)
 for ip in 253 250 254 1 10; do
     test_ip="$NETWORK.$ip"
     if [[ "$test_ip" != "$CURRENT_IP" ]] && timeout 2s bash -c "</dev/tcp/$test_ip/3260" 2>/dev/null; then
-        if timeout 3s sudo iscsiadm -m discovery -t st -p "$test_ip:3260" >/dev/null 2>&1; then
-            TARGET_IP="$test_ip"
-            break
-        fi
+        TARGET_IP="$test_ip"
+        break
     fi
 done
-
 [[ -z "$TARGET_IP" ]] && TARGET_IP="$DEFAULT_TGT_IP"
 echo "Servidor iSCSI: $TARGET_IP"
 
@@ -57,39 +75,41 @@ echo "InitiatorName=$INITIATOR" | sudo tee /etc/iscsi/initiatorname.iscsi >/dev/
 
 # Configuração básica do iSCSI
 sudo tee /etc/iscsi/iscsid.conf >/dev/null <<EOF
-node.startup = automatic
+node.startup = manual
 node.session.auth.authmethod = None
 discovery.sendtargets.auth.authmethod = None
 node.conn.timeo.login_timeout = 15
 node.session.timeo.replacement_timeout = 120
-node.conn.timeo.logout_timeout = 15
-node.conn.timeo.noop_out_interval = 5
-node.conn.timeo.noop_out_timeout = 5
-node.session.queue_depth = 32
 EOF
 
-# Reiniciar serviços iSCSI
-sudo systemctl restart open-iscsi iscsid
-sleep 3
+# CORREÇÃO CRÍTICA: Iniciar iscsid e aguardar estar pronto
+echo "Iniciando iscsid..."
+sudo systemctl enable iscsid
+sudo systemctl start iscsid
 
-# Discovery de targets
+# AGUARDAR iscsid estar completamente operacional
+if ! wait_for_iscsid; then
+    echo "ERRO: iscsid não ficou operacional"
+    exit 1
+fi
+
+# Agora que iscsid está pronto, fazer discovery
 echo "Descobrindo targets..."
 DISCOVERY=$(sudo iscsiadm -m discovery -t st -p "$TARGET_IP:3260" 2>/dev/null || echo "")
 
 if [[ -z "$DISCOVERY" ]]; then
-    echo "ERRO: Nenhum target encontrado em $TARGET_IP"
+    echo "ERRO: Nenhum target encontrado"
     exit 1
 fi
 
-# Conectar aos targets - MÉTODO SIMPLES E FUNCIONAL
+echo "Targets encontrados:"
+echo "$DISCOVERY"
+
+# Conectar aos targets COM iscsid operacional
 echo "Conectando aos targets..."
 CONNECTED=0
 
-# Salvar discovery em arquivo temporário
-echo "$DISCOVERY" > /tmp/iscsi_targets.txt
-
-# Processar cada linha do arquivo
-while IFS= read -r line; do
+echo "$DISCOVERY" | while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     
     PORTAL=$(echo "$line" | awk '{print $1}')
@@ -98,160 +118,128 @@ while IFS= read -r line; do
     [[ -z "$PORTAL" || -z "$IQN" ]] && continue
     
     echo "Conectando a $IQN..."
-    if timeout 10s sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --login >/dev/null 2>&1; then
-        echo "Conectado a $IQN"
-        ((CONNECTED++))
-    else
-        echo "Falha ao conectar a $IQN"
-    fi
-    sleep 1
     
-done < /tmp/iscsi_targets.txt
+    # Tentar conexão com retry
+    local retry=0
+    while [[ $retry -lt 3 ]]; do
+        if sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --login 2>/dev/null; then
+            echo "✅ Conectado a $IQN"
+            ((CONNECTED++))
+            break
+        else
+            ((retry++))
+            echo "Tentativa $retry/3 falhou, aguardando..."
+            sleep 3
+        fi
+    done
+done
 
-rm -f /tmp/iscsi_targets.txt
-
-if [[ $CONNECTED -eq 0 ]]; then
-    echo "ERRO: Nenhum target conectou"
+# Verificar conexões
+SESSIONS=$(sudo iscsiadm -m session 2>/dev/null | wc -l)
+if [[ $SESSIONS -eq 0 ]]; then
+    echo "ERRO: Nenhuma sessão estabelecida"
     exit 1
 fi
 
-echo "Conectado a $CONNECTED target(s)"
+echo "✅ $SESSIONS sessões iSCSI ativas"
 
-# Aguardar detecção de dispositivos
-echo "Aguardando dispositivos..."
+# Aguardar dispositivos
+echo "Aguardando dispositivos SCSI..."
 sleep 15
-sudo iscsiadm -m session --rescan >/dev/null 2>&1 || true
+sudo iscsiadm -m session --rescan 2>/dev/null || true
 sleep 10
 
-# Detectar dispositivos iSCSI
+# Detectar dispositivos
 DEVICES=""
-for i in {1..5}; do
+for i in {1..10}; do
     DEVICES=$(lsscsi 2>/dev/null | grep -E "(IET|LIO|SCST)" | awk '{print $6}' | head -1)
     [[ -n "$DEVICES" ]] && break
-    echo "Tentativa $i/5 - aguardando dispositivos..."
-    sleep 10
+    echo "Aguardando dispositivos... ($i/10)"
+    sleep 5
 done
 
 if [[ -z "$DEVICES" ]]; then
-    echo "ERRO: Nenhum dispositivo iSCSI detectado"
-    echo "Sessões ativas: $(sudo iscsiadm -m session 2>/dev/null | wc -l)"
+    echo "ERRO: Nenhum dispositivo detectado"
+    echo "Sessões: $SESSIONS"
+    lsscsi
     exit 1
 fi
 
-echo "Dispositivo detectado: $DEVICES"
+echo "✅ Dispositivo: $DEVICES"
 
 # Obter WWID
-WWID=$(sudo /lib/udev/scsi_id -g -u -d "$DEVICES" 2>/dev/null || echo "")
+WWID=$(sudo /lib/udev/scsi_id -g -u -d "$DEVICES" 2>/dev/null)
 if [[ -z "$WWID" ]]; then
-    echo "ERRO: Não foi possível obter WWID"
+    echo "ERRO: Falha ao obter WWID"
     exit 1
 fi
-
-echo "WWID: $WWID"
+echo "✅ WWID: $WWID"
 
 # Configurar multipath
+echo "Configurando multipath..."
 [[ -f /etc/multipath.conf ]] && sudo cp /etc/multipath.conf /etc/multipath.conf.backup
 
 sudo tee /etc/multipath.conf >/dev/null <<EOF
 defaults {
     user_friendly_names yes
     find_multipaths yes
-    checker_timeout 60
-    dev_loss_tmo infinity
-    fast_io_fail_tmo 5
 }
-
-blacklist {
-    devnode "^(ram|raw|loop|fd|md|dm-|sr|scd|st|sda)[0-9]*"
-    device {
-        vendor "ATA"
-    }
-}
-
 multipaths {
     multipath {
         wwid $WWID
         alias $MULTIPATH_ALIAS
-        path_checker tur
-        no_path_retry queue
     }
 }
-
 devices {
     device {
         vendor "IET"
         product "VIRTUAL-DISK"
         path_checker tur
-        no_path_retry queue
-    }
-    device {
-        vendor "LIO-ORG"
-        product "*"
-        path_checker tur
-        no_path_retry queue
     }
 }
 EOF
 
 # Inicializar multipath
-echo "Configurando multipath..."
-sudo systemctl enable --now multipathd >/dev/null 2>&1
+sudo systemctl enable multipathd
+sudo systemctl restart multipathd
+sleep 10
+sudo multipath -r
 sleep 10
 
-sudo multipath -F >/dev/null 2>&1 || true
-sudo multipath -r >/dev/null 2>&1 || true
-sleep 10
-
-# Verificar criação do dispositivo
-echo "Verificando dispositivo multipath..."
+# Verificar dispositivo final
 for i in {1..15}; do
-    if [[ -e "/dev/mapper/$MULTIPATH_ALIAS" ]]; then
+    if [[ -b "/dev/mapper/$MULTIPATH_ALIAS" ]]; then
         break
     fi
-    echo "Tentativa $i/15 - aguardando criação do dispositivo..."
-    sudo multipath -r >/dev/null 2>&1 || true
-    sleep 5
+    echo "Criando dispositivo multipath... ($i/15)"
+    sudo multipath -r
+    sleep 3
 done
 
-# Validação final
+# Resultado final
 if [[ -b "/dev/mapper/$MULTIPATH_ALIAS" ]]; then
-    SIZE=$(lsblk -dn -o SIZE "/dev/mapper/$MULTIPATH_ALIAS" 2>/dev/null || echo "N/A")
-    SESSIONS=$(sudo iscsiadm -m session 2>/dev/null | wc -l)
+    SIZE=$(lsblk -dn -o SIZE "/dev/mapper/$MULTIPATH_ALIAS")
     
     echo ""
-    echo "✅ SUCESSO: Configuração concluída!"
-    echo "   Dispositivo: /dev/mapper/$MULTIPATH_ALIAS ($SIZE)"
-    echo "   Sessões iSCSI: $SESSIONS"
-    echo "   Servidor: $TARGET_IP"
+    echo "🎉 SUCESSO TOTAL!"
+    echo "=================="
+    echo "Dispositivo: /dev/mapper/$MULTIPATH_ALIAS ($SIZE)"
+    echo "Sessões: $SESSIONS"
+    echo "Servidor: $TARGET_IP"
+    echo "WWID: $WWID"
     echo ""
-    echo "Execute 'sudo ./test-iscsi-lun.sh' para validar"
     
-    # Teste básico de leitura
+    # Teste final
     if sudo dd if="/dev/mapper/$MULTIPATH_ALIAS" of=/dev/null bs=4k count=1 >/dev/null 2>&1; then
-        echo "   Teste de leitura: OK"
+        echo "✅ Teste de I/O: SUCESSO"
     fi
     
-    # Configurar auto-start
-    sudo systemctl enable open-iscsi multipathd >/dev/null 2>&1
-    
-    # Status final
     echo ""
-    echo "📋 Status final:"
-    echo "   InitiatorName: $INITIATOR"
-    echo "   WWID: $WWID"
-    echo "   Multipath status:"
-    sudo multipath -ll "$MULTIPATH_ALIAS" 2>/dev/null || echo "   Status não disponível"
+    echo "✅ Configuração iSCSI/Multipath CONCLUÍDA!"
     
 else
-    echo "ERRO: Dispositivo /dev/mapper/$MULTIPATH_ALIAS não foi criado"
-    echo "Debug info:"
-    echo "  Mapas multipath: $(sudo multipath -ll 2>/dev/null | wc -l)"
-    echo "  Dispositivos /dev/mapper: $(ls /dev/mapper/ | grep -v control | wc -l)"
-    echo "  Sessões iSCSI: $(sudo iscsiadm -m session 2>/dev/null | wc -l)"
-    echo ""
-    echo "Comandos de diagnóstico:"
-    echo "  sudo multipath -ll"
-    echo "  sudo iscsiadm -m session"
-    echo "  lsscsi | grep IET"
+    echo "❌ ERRO: Dispositivo multipath não foi criado"
+    echo "Sessões: $(sudo iscsiadm -m session | wc -l)"
+    echo "Multipath: $(sudo multipath -ll | wc -l)"
     exit 1
 fi
