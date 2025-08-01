@@ -37,9 +37,20 @@ fi
 print_header "3) Criando recurso Pacemaker 'test-dlm'"
 if sudo pcs resource show test-dlm &>/dev/null; then
   print_warning "Recurso 'test-dlm' já existe; removendo anterior"
-  sudo pcs resource delete test-dlm &>/dev/null
+  sudo pcs resource delete test-dlm --quiet || true
+  # Aguardar remoção
+  for i in {1..6}; do
+    if ! sudo pcs resource show test-dlm &>/dev/null; then
+      print_success "Recurso 'test-dlm' removido"
+      break
+    fi
+    sleep 2
+  done
 fi
-if sudo pcs resource create test-dlm systemd:dlm op monitor interval=10s on-fail=restart; then
+
+# Recriar recurso
+if sudo pcs resource create test-dlm systemd:dlm \
+      op monitor interval=10s on-fail=restart; then
   print_success "Recurso 'test-dlm' criado"
 else
   print_error "Falha ao criar recurso 'test-dlm'"
