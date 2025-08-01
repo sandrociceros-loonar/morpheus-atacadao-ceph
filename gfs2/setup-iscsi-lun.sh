@@ -21,11 +21,15 @@ wait_for_iscsid() {
     local attempt=1
     
     while [[ $attempt -le $max_attempts ]]; do
-        if systemctl is-active --quiet iscsid && systemctl is-active --quiet open-iscsi; then
-            # Verifica se o socket está respondendo
-            if sudo iscsiadm -m discovery --version >/dev/null 2>&1; then
-                echo "✅ iscsid está operacional (tentativa $attempt)"
-                return 0
+        # Verifica se os serviços estão ativos
+        if systemctl is-active --quiet iscsid; then
+            # Verifica se há processos iscsid rodando
+            if pgrep -f "iscsid" > /dev/null; then
+                # Verifica se o socket está respondendo ou se já há conexões estabelecidas
+                if sudo iscsiadm -m session > /dev/null 2>&1 || sudo iscsiadm -m discovery --version > /dev/null 2>&1; then
+                    echo "✅ iscsid está operacional (tentativa $attempt)"
+                    return 0
+                fi
             fi
         fi
         
