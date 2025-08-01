@@ -119,11 +119,15 @@ fi
 echo "Targets encontrados:"
 echo "$DISCOVERY"
 
+# Temporariamente desativa o set -e
+set +e
+
 # Conectar aos targets
 echo "Conectando aos targets..."
 CONNECTED=0
+FAILED=0
 
-echo "$DISCOVERY" | while IFS= read -r line; do
+while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     
     PORTAL=$(echo "$line" | awk '{print $1}')
@@ -133,33 +137,57 @@ echo "$DISCOVERY" | while IFS= read -r line; do
     
     echo "Conectando a $IQN..."
     
-    # Primeiro, remove qualquer configuração antiga
-    sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" -u >/dev/null 2>&1 || true
-    sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=delete >/dev/null 2>&1 || true
+    # Remove configuração antiga com mais cuidado
+    if sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" -u >/dev/null 2>&1; then
+        echo "Desconectado do target existente"
+    fi
+    if sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=delete >/dev/null 2>&1; then
+        echo "Removida configuração antiga"
+    fi
     
-    # Configura o nó
-    sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=new
+    # Configura o nó com verificação de erros
+    if ! sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=new; then
+        echo "❌ Falha ao criar novo nó"
+        ((FAILED++))
+        continue
+    fi
+    
+    # Configura parâmetros do nó
     sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=update -n node.startup -v automatic
     sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=update -n node.session.auth.authmethod -v None
+    sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=update -n node.session.timeo.replacement_timeout -v 120
     
-    # Tenta conectar com mais informações de debug
-    if ! sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --login; then
-        echo "Primeira tentativa falhou, aguardando 5 segundos e tentando novamente..."
-        sleep 5
+    # Tenta conectar com retry
+    LOGIN_SUCCESS=0
+    for attempt in {1..3}; do
         if sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --login; then
-            echo "✅ Conectado a $IQN na segunda tentativa"
+            echo "✅ Conectado a $IQN (tentativa $attempt)"
             ((CONNECTED++))
+            LOGIN_SUCCESS=1
+            break
         else
-            echo "❌ Falha ao conectar a $IQN"
-            echo "Detalhes do nó:"
-            sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=show
+            echo "Tentativa $attempt falhou, aguardando antes de tentar novamente..."
+            sleep 5
         fi
-    else
-        echo "✅ Conectado a $IQN"
-        ((CONNECTED++))
+    done
+    
+    if [ $LOGIN_SUCCESS -eq 0 ]; then
+        echo "❌ Falha ao conectar a $IQN após 3 tentativas"
+        echo "Detalhes do nó:"
+        sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --op=show
+        ((FAILED++))
     fi
+    
     sleep 2
-done
+done <<< "$DISCOVERY"
+
+# Reativa o set -e
+set -e
+
+# Verifica resultado total
+echo "Resumo das conexões:"
+echo "✅ Conexões bem sucedidas: $CONNECTED"
+echo "❌ Conexões com falha: $FAILED"
 
 # Verificar conexões
 SESSIONS=$(sudo iscsiadm -m session 2>/dev/null | wc -l)
