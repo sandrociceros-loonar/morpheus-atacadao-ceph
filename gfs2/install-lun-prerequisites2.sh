@@ -31,6 +31,8 @@ readonly VG_NAME="vg_cluster"
 readonly LV_NAME="lv_gfs2"
 readonly MOUNT_POINT="/mnt/gfs2_volume"
 
+
+
 # ----------------------------------------------------------------------------
 # Detectar papel do nó
 detect_node_role() {
