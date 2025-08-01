@@ -2,7 +2,7 @@
 
 # ============================================================================
 # SCRIPT: setup-iscsi-lun.sh
-# VERSÃO: DEFINITIVA - Resolve Race Condition
+# VERSÃO: CORRIGIDA - Função de teste adequada
 # AUTOR: sandro.cicero@loonar.cloud
 # ============================================================================
 
@@ -12,23 +12,26 @@ set -e
 DEFAULT_TGT_IP="192.168.0.250"
 MULTIPATH_ALIAS="fc-lun-cluster"
 
-echo "Configurando iSCSI/Multipath - Versão Definitiva..."
+echo "Configurando iSCSI/Multipath - Versão Corrigida..."
 
-# Função para aguardar iscsid estar pronto
+# CORREÇÃO: Função correta para aguardar iscsid
 wait_for_iscsid() {
     echo "Aguardando iscsid estar completamente operacional..."
-    local max_attempts=30
+    local max_attempts=15
     local attempt=1
     
     while [[ $attempt -le $max_attempts ]]; do
-        # Testar se iscsiadm consegue se comunicar com iscsid
-        if sudo iscsiadm -m session >/dev/null 2>&1; then
-            echo "✅ iscsid está operacional (tentativa $attempt)"
-            return 0
+        # CORREÇÃO: Teste correto - verificar se serviço está ativo
+        if systemctl is-active --quiet iscsid; then
+            # Teste adicional: tentar comunicar com iscsid
+            if sudo iscsiadm -m iface >/dev/null 2>&1; then
+                echo "✅ iscsid está operacional (tentativa $attempt)"
+                return 0
+            fi
         fi
         
         echo "Aguardando iscsid... ($attempt/$max_attempts)"
-        sleep 2
+        sleep 3
         ((attempt++))
     done
     
@@ -82,18 +85,20 @@ node.conn.timeo.login_timeout = 15
 node.session.timeo.replacement_timeout = 120
 EOF
 
-# CORREÇÃO CRÍTICA: Iniciar iscsid e aguardar estar pronto
+# Iniciar iscsid
 echo "Iniciando iscsid..."
 sudo systemctl enable iscsid
 sudo systemctl start iscsid
 
-# AGUARDAR iscsid estar completamente operacional
+# AGUARDAR iscsid com teste corrigido
 if ! wait_for_iscsid; then
     echo "ERRO: iscsid não ficou operacional"
+    echo "Status do serviço:"
+    systemctl status iscsid --no-pager
     exit 1
 fi
 
-# Agora que iscsid está pronto, fazer discovery
+# Fazer discovery
 echo "Descobrindo targets..."
 DISCOVERY=$(sudo iscsiadm -m discovery -t st -p "$TARGET_IP:3260" 2>/dev/null || echo "")
 
@@ -105,7 +110,7 @@ fi
 echo "Targets encontrados:"
 echo "$DISCOVERY"
 
-# Conectar aos targets COM iscsid operacional
+# Conectar aos targets
 echo "Conectando aos targets..."
 CONNECTED=0
 
@@ -119,25 +124,25 @@ echo "$DISCOVERY" | while IFS= read -r line; do
     
     echo "Conectando a $IQN..."
     
-    # Tentar conexão com retry
-    local retry=0
-    while [[ $retry -lt 3 ]]; do
-        if sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --login 2>/dev/null; then
-            echo "✅ Conectado a $IQN"
-            ((CONNECTED++))
-            break
-        else
-            ((retry++))
-            echo "Tentativa $retry/3 falhou, aguardando..."
-            sleep 3
-        fi
-    done
+    if sudo iscsiadm -m node -T "$IQN" -p "$PORTAL" --login 2>/dev/null; then
+        echo "✅ Conectado a $IQN"
+        ((CONNECTED++))
+    else
+        echo "❌ Falha ao conectar a $IQN"
+    fi
+    sleep 2
 done
 
 # Verificar conexões
 SESSIONS=$(sudo iscsiadm -m session 2>/dev/null | wc -l)
 if [[ $SESSIONS -eq 0 ]]; then
     echo "ERRO: Nenhuma sessão estabelecida"
+    
+    # Debug adicional
+    echo "Status do iscsid:"
+    systemctl status iscsid --no-pager
+    echo "Teste de comunicação:"
+    sudo iscsiadm -m iface
     exit 1
 fi
 
@@ -161,6 +166,7 @@ done
 if [[ -z "$DEVICES" ]]; then
     echo "ERRO: Nenhum dispositivo detectado"
     echo "Sessões: $SESSIONS"
+    echo "Dispositivos SCSI:"
     lsscsi
     exit 1
 fi
@@ -239,7 +245,9 @@ if [[ -b "/dev/mapper/$MULTIPATH_ALIAS" ]]; then
     
 else
     echo "❌ ERRO: Dispositivo multipath não foi criado"
-    echo "Sessões: $(sudo iscsiadm -m session | wc -l)"
-    echo "Multipath: $(sudo multipath -ll | wc -l)"
+    echo "Debug:"
+    echo "  Sessões: $(sudo iscsiadm -m session | wc -l)"
+    echo "  Multipath: $(sudo multipath -ll | wc -l)"
+    echo "  /dev/mapper: $(ls /dev/mapper/)"
     exit 1
 fi
