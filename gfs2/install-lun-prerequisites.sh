@@ -635,21 +635,71 @@ detect_available_devices() {
 configure_lvm_cluster() {
     print_header "⚙️  Configurando LVM para Cluster"
     
-    # Verificar se DLM está ativo
+    # Verificar e configurar DLM se necessário
     print_info "Verificando status do DLM..."
-    if ! sudo pcs status | grep -q "dlm.*Started"; then
-        print_error "DLM não está ativo. Execute primeiro a configuração do cluster."
-        return 1
+    if ! sudo pcs resource show dlm-clone &>/dev/null; then
+        print_info "Recurso DLM não encontrado. Criando..."
+        if sudo pcs resource create dlm systemd:dlm \
+            op monitor interval=60s on-fail=fence \
+            clone interleave=true ordered=true; then
+            print_success "Recurso DLM criado"
+            sleep 10
+        else
+            print_error "Falha ao criar recurso DLM"
+            return 1
+        fi
     fi
+    
+    # Aguardar DLM iniciar
+    print_info "Aguardando DLM ficar ativo..."
+    local max_wait=30
+    local count=0
+    while ! sudo pcs status | grep -q "dlm.*Started"; do
+        sleep 2
+        ((count+=2))
+        if [[ $count -ge $max_wait ]]; then
+            print_error "Timeout aguardando DLM ficar ativo"
+            return 1
+        fi
+        echo -n "."
+    done
+    echo ""
     print_success "DLM está ativo"
     
-    # Verificar se lvmlockd está rodando
+    # Verificar e configurar lvmlockd como recurso do cluster
     print_info "Verificando status do lvmlockd..."
-    if ! systemctl is-active --quiet lvmlockd; then
-        print_info "Iniciando lvmlockd..."
-        sudo systemctl start lvmlockd
-        sleep 5
+    if ! sudo pcs resource show lvmlockd-clone &>/dev/null; then
+        print_info "Configurando lvmlockd como recurso do cluster..."
+        if sudo pcs resource create lvmlockd systemd:lvmlockd \
+            op monitor interval=60s on-fail=fence \
+            clone interleave=true ordered=true; then
+            print_success "Recurso lvmlockd criado"
+            
+            # Configurar dependência com DLM
+            sudo pcs constraint order "start dlm-clone then lvmlockd-clone"
+            sudo pcs constraint colocation add "lvmlockd-clone with dlm-clone"
+            
+            sleep 10
+        else
+            print_error "Falha ao criar recurso lvmlockd"
+            return 1
+        fi
     fi
+    
+    # Aguardar lvmlockd iniciar
+    print_info "Aguardando lvmlockd ficar ativo..."
+    local max_wait=30
+    local count=0
+    while ! sudo pcs status | grep -q "lvmlockd.*Started"; do
+        sleep 2
+        ((count+=2))
+        if [[ $count -ge $max_wait ]]; then
+            print_error "Timeout aguardando lvmlockd ficar ativo"
+            return 1
+        fi
+        echo -n "."
+    done
+    echo ""
     print_success "lvmlockd está ativo"
     
     # Detectar device disponível
