@@ -23,10 +23,10 @@ error_exit()    { print_error "$1"; exit 1; }
 # ----------------------------------------------------------------------------
 # Variáveis do cluster e volume
 readonly CLUSTER_NAME="cluster_gfs2"
-readonly NODE1_IP="192.168.0.252"
-readonly NODE2_IP="192.168.0.251"
-readonly NODE1_NAME="fc-test1"
-readonly NODE2_NAME="fc-test2"
+readonly NODE1_IP="10.113.221.240"
+readonly NODE2_IP="10.113.221.241"
+readonly NODE1_NAME="srvmvm001a"
+readonly NODE2_NAME="srvmvm001b"
 readonly VG_NAME="vg_cluster"
 readonly LV_NAME="lv_gfs2"
 readonly MOUNT_POINT="/mnt/gfs2_volume"
