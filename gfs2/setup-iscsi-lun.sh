@@ -136,24 +136,20 @@ fi
 # Se a configuração mínima funcionar, adicionar o resto
 echo "Configuração mínima OK, adicionando configuração completa..."
 sudo tee /etc/iscsi/iscsid.conf >/dev/null <<EOF
-# Configurações básicas
 node.startup = automatic
 node.session.auth.authmethod = None
 node.session.timeo.replacement_timeout = 120
 
-# Configurações de timeout
 node.conn[0].timeo.login_timeout = 15
 node.conn[0].timeo.logout_timeout = 15
 node.conn[0].timeo.noop_out_interval = 5
 node.conn[0].timeo.noop_out_timeout = 5
 
-# Configurações de sessão
 node.session.initial_login_retry_max = 8
 node.session.cmds_max = 128
 node.session.queue_depth = 32
 node.session.nr_sessions = 1
 
-# Configurações de performance
 node.session.iscsi.InitialR2T = No
 node.session.iscsi.ImmediateData = Yes
 node.session.iscsi.FirstBurstLength = 262144
