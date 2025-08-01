@@ -14,6 +14,31 @@ MULTIPATH_ALIAS="fc-lun-cluster"
 
 echo "Configurando iSCSI/Multipath - Versão Corrigida..."
 
+# Função para aguardar multipathd
+wait_for_multipathd() {
+    echo "Aguardando multipathd estar completamente operacional..."
+    local max_attempts=15
+    local attempt=1
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        if systemctl is-active --quiet multipathd; then
+            if pgrep -f "multipathd" > /dev/null; then
+                if multipath -t > /dev/null 2>&1; then
+                    echo "✅ multipathd está operacional (tentativa $attempt)"
+                    return 0
+                fi
+            fi
+        fi
+        
+        echo "Aguardando multipathd... ($attempt/$max_attempts)"
+        sleep 5
+        ((attempt++))
+    done
+    
+    echo "❌ Erro: multipathd não está operacional após $max_attempts tentativas"
+    return 1
+}
+
 # Função para aguardar iscsid
 wait_for_iscsid() {
     echo "Aguardando iscsid estar completamente operacional..."
@@ -258,6 +283,13 @@ echo "✅ WWID: $WWID"
 
 # Configurar multipath
 echo "Configurando multipath..."
+
+# Verificar se multipathd está operacional
+wait_for_multipathd || {
+    echo "❌ Erro: Não foi possível estabelecer conexão com o serviço multipathd"
+    exit 1
+}
+
 [[ -f /etc/multipath.conf ]] && sudo cp /etc/multipath.conf /etc/multipath.conf.backup
 
 # Criar configuração mais simples primeiro
@@ -274,8 +306,10 @@ defaults {
     failback immediate
     rr_weight uniform
     no_path_retry fail
+    queue_without_daemon no
     dev_loss_tmo infinity
     fast_io_fail_tmo 5
+    features "0"
 }
 
 blacklist {
@@ -290,14 +324,19 @@ devices {
         product ".*"
         path_checker tur
         path_selector "round-robin 0"
+        features "0"
+        hardware_handler "0"
         path_grouping_policy failover
         failback immediate
         prio const
+        prio_args "1"
         rr_weight uniform
         rr_min_io 100
-        no_path_retry 5
+        no_path_retry fail
         dev_loss_tmo infinity
         fast_io_fail_tmo 5
+        queue_without_daemon no
+        product_blacklist "LUNZ"
     }
 }
 
@@ -346,13 +385,48 @@ sudo systemctl status multipathd
 
 echo "Rescaneando dispositivos..."
 sudo multipathd reconfigure
-sudo multipathd resize
+# Only resize if we have a device to resize
+if [[ -b "/dev/mapper/$MULTIPATH_ALIAS" ]]; then
+    sudo multipathd resize map "$MULTIPATH_ALIAS"
+fi
 sleep 2
 
 echo "Criando mapa para o dispositivo..."
 sudo multipath -v3
 sudo multipath -ll
 sleep 2
+
+# Verifica se o dispositivo multipath está corretamente configurado
+verify_multipath_device() {
+    local device="$1"
+    local max_attempts=5
+    local attempt=1
+    
+    echo "Verificando configuração do dispositivo multipath $device..."
+    while [[ $attempt -le $max_attempts ]]; do
+        if [[ -b "/dev/mapper/$device" ]]; then
+            local dm_table
+            dm_table=$(sudo dmsetup table "$device" 2>/dev/null)
+            if [[ -n "$dm_table" ]]; then
+                echo "✅ Dispositivo multipath $device está configurado corretamente"
+                return 0
+            fi
+        fi
+        
+        echo "Aguardando dispositivo multipath $device... ($attempt/$max_attempts)"
+        sleep 5
+        ((attempt++))
+    done
+    
+    echo "❌ Erro: Falha ao verificar dispositivo multipath $device após $max_attempts tentativas"
+    return 1
+}
+
+# Verifica o dispositivo multipath
+verify_multipath_device "$MULTIPATH_ALIAS" || {
+    echo "❌ Erro: Falha ao configurar dispositivo multipath $MULTIPATH_ALIAS"
+    exit 1
+}
 
 # Força detecção do dispositivo específico
 echo "Adicionando dispositivo específico..."
