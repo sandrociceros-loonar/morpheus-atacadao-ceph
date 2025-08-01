@@ -891,6 +891,7 @@ configure_lvm_cluster() {
 # CONFIGURAÇÃO DO ARQUIVO COROSYNC
 # ============================================================================
 
+# Configuração do corosync.conf para incluir os nós corretamente
 configure_corosync() {
     print_header "🔧 Configurando corosync.conf"
 
@@ -905,7 +906,7 @@ configure_corosync() {
     sudo cp "$corosync_file" "${corosync_file}.backup.$(date +%F_%T)"
     print_success "Backup do corosync.conf criado"
 
-    # Adicionando configuração de exemplo
+    # Adicionando configuração correta
     sudo bash -c "cat > $corosync_file" <<EOF
     totem {
         version: 2
