@@ -502,22 +502,22 @@ detect_available_devices() {
     print_info "Procurando devices multipath..."
     shopt -s nullglob
     
-    # Debug: listar todos os devices em /dev/mapper
-    print_info "Conteúdo de /dev/mapper:"
-    ls -l /dev/mapper/
-    
     # Debug: mostrar saída do comando multipath -ll
     print_info "Saída do multipath -ll:"
     multipath -ll
     
-    for device in /dev/mapper/* /dev/mpath/*; do
-        if [[ -b "$device" && "$device" != "/dev/mapper/control" && ! "$device" =~ ^/dev/mapper/dm-[0-9]+$ ]]; then
-            print_info "Verificando device multipath: $device"
-            check_and_add_device "$device" "multipath"
-        else
-            print_info "Ignorando device: $device"
+    # Procurar devices multipath ativos
+    while IFS= read -r line; do
+        if [[ $line =~ ^([^[:space:]]+).*dm-[0-9]+ ]]; then
+            local mp_name="${BASH_REMATCH[1]}"
+            local mp_device="/dev/mapper/$mp_name"
+            
+            if [[ -b "$mp_device" ]]; then
+                print_info "Encontrado device multipath ativo: $mp_device"
+                check_and_add_device "$mp_device" "multipath"
+            fi
         fi
-    done
+    done < <(multipath -l | grep -v "^$")
     
     # Procurar por LUNs em /dev/disk/by-id (especialmente wwn e scsi)
     print_info "Procurando LUNs por WWN e SCSI ID..."
