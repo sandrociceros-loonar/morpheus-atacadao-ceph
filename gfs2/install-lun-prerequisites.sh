@@ -596,11 +596,13 @@ detect_available_devices() {
     fi
     
     # Debug: mostrar todos os devices encontrados
+    echo "aqui 1"
     print_info "Devices candidatos detectados:"
     for i in "${!devices[@]}"; do
         echo "$((i + 1)). ${devices[i]}"
     done
-    
+    echo "aqui 2"
+
     # Selecionar device automaticamente ou manualmente
     local selected_device
     if [[ ${#devices[@]} -eq 1 ]]; then
