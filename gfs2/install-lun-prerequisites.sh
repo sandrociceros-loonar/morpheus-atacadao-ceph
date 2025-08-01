@@ -507,8 +507,11 @@ detect_available_devices() {
                 [[ "$model" != "N/A" ]] && info+=" - Model: $model"
                 [[ "$type" == "multipath" ]] && info+=" - DM: $dm_name"
                 
+                echo "==== DEBUG: Adicionando device ====" >&2
                 devices+=("$info")
-                print_success "✅ Device $type adicionado: $info"
+                echo "Device adicionado ao array: $info" >&2
+                echo "Tamanho atual do array: ${#devices[@]}" >&2
+                print_success "✅ Device $type adicionado: $info" >&2
             else
                 if [[ -n "$mountpoint" ]]; then
                     print_warning "Device $device montado em $mountpoint"
@@ -518,15 +521,15 @@ detect_available_devices() {
     }
     
     # Procurar por devices multipath
-    print_info "Procurando devices multipath..."
+    print_info "Procurando devices multipath..." >&2
     shopt -s nullglob
     
     # Debug: mostrar saída do comando multipath -ll
-    print_info "Saída do multipath -ll:"
-    sudo multipath -ll
+    print_info "Saída do multipath -ll:" >&2
+    sudo multipath -ll >&2
     
-    print_info "Conteúdo do /dev/mapper:"
-    ls -l /dev/mapper/
+    print_info "Conteúdo do /dev/mapper:" >&2
+    ls -l /dev/mapper/ >&2
     
     print_info "Procurando devices multipath ativos..."
     
@@ -596,12 +599,17 @@ detect_available_devices() {
     fi
     
     # Debug: mostrar todos os devices encontrados
-    echo "aqui 1"
-    print_info "Devices candidatos detectados:"
-    for i in "${!devices[@]}"; do
-        echo "$((i + 1)). ${devices[i]}"
-    done
-    echo "aqui 2"
+    echo -e "\n==== DEBUG: Início da lista de devices ====" >&2
+    echo "Total de devices encontrados: ${#devices[@]}" >&2
+    if [[ ${#devices[@]} -gt 0 ]]; then
+        print_info "Devices candidatos detectados:" >&2
+        for i in "${!devices[@]}"; do
+            echo "$((i + 1)). ${devices[i]}" >&2
+        done
+    else
+        print_warning "Nenhum device na lista devices[]" >&2
+    fi
+    echo "==== DEBUG: Fim da lista de devices ====" >&2
 
     # Selecionar device automaticamente ou manualmente
     local selected_device
