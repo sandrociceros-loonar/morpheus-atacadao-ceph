@@ -266,6 +266,10 @@ defaults {
     user_friendly_names yes
     find_multipaths yes
     path_selector "round-robin 0"
+    polling_interval 10
+    path_checker "tur"
+    prio "const"
+    prio_args "1 alua"
     path_grouping_policy multibus
     failback immediate
     rr_weight uniform
@@ -308,6 +312,20 @@ sudo multipathd show paths
 echo "Configuração do multipath:"
 sudo multipathd show config
 
+# Verificar se o módulo dm-multipath está carregado
+if ! lsmod | grep -q dm_multipath; then
+    echo "Carregando módulo dm-multipath..."
+    sudo modprobe dm-multipath
+    sleep 2
+fi
+
+# Verificar se o device-mapper está pronto
+if ! sudo dmsetup status &>/dev/null; then
+    echo "Inicializando device-mapper..."
+    sudo systemctl start dm-event.socket dm-event.service
+    sleep 2
+fi
+
 # Inicializar multipath
 echo "Reiniciando serviço multipath..."
 sudo systemctl stop multipathd
@@ -323,11 +341,18 @@ echo "Verificando estado do serviço multipathd:"
 sudo systemctl status multipathd
 
 echo "Rescaneando dispositivos..."
-sudo multipath -v3 -R   # Rescan verbose
-sleep 5
+sudo multipathd reconfigure
+sudo multipathd resize
+sleep 2
 
 echo "Criando mapa para o dispositivo..."
-sudo multipath -v3 -a /dev/sdb   # Adiciona dispositivo específico
+sudo multipath -v3
+sudo multipath -ll
+sleep 2
+
+# Força detecção do dispositivo específico
+echo "Adicionando dispositivo específico..."
+sudo multipath -v3 "$DEVICES"
 sleep 5
 
 echo "Status do multipath:"
