@@ -21,8 +21,8 @@ NC='\033[0m' # No Color
 readonly CLUSTER_NAME="cluster_gfs2"
 readonly NODE1_IP="192.168.0.252"
 readonly NODE2_IP="192.168.0.251"
-readonly NODE1_NAME="fc-test1"
-readonly NODE2_NAME="fc-test2"
+readonly NODE1_NAME="srvmvm001a"
+readonly NODE2_NAME="srvmvm001b"
 
 # ============================================================================
 # FUNÇÕES AUXILIARES
