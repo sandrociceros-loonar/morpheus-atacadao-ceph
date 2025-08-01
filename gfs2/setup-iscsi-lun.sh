@@ -72,6 +72,12 @@ echo "Limpando estado iSCSI anterior..."
 sudo systemctl stop open-iscsi || true
 sudo systemctl stop iscsid || true
 sudo pkill -f iscsid || true
+
+# Limpar sockets e locks
+echo "Limpando sockets e locks..."
+sudo rm -f /var/lock/iscsi/* || true
+sudo rm -f /var/run/iscsid.pid || true
+sudo rm -f /var/run/lock/iscsi/* || true
 sleep 3
 
 # Informações básicas
@@ -105,17 +111,59 @@ INITIATOR="iqn.2004-10.com.ubuntu:01:$(openssl rand -hex 4):$HOSTNAME"
 echo "InitiatorName=$INITIATOR" | sudo tee /etc/iscsi/initiatorname.iscsi >/dev/null
 
 # Configuração básica do iSCSI
+echo "Criando arquivo de configuração iSCSI..."
+# Primeiro, criar um arquivo mínimo para teste
 sudo tee /etc/iscsi/iscsid.conf >/dev/null <<EOF
 node.startup = automatic
 node.session.auth.authmethod = None
 node.session.timeo.replacement_timeout = 120
+EOF
+
+# Verificar a configuração mínima
+echo "Verificando configuração mínima..."
+if ! sudo iscsid -c /etc/iscsi/iscsid.conf -f; then
+    echo "❌ ERRO: Configuração mínima inválida"
+    echo "Conteúdo do arquivo:"
+    cat /etc/iscsi/iscsid.conf
+    exit 1
+fi
+
+# Se a configuração mínima funcionar, adicionar o resto
+echo "Configuração mínima OK, adicionando configuração completa..."
+sudo tee /etc/iscsi/iscsid.conf >/dev/null <<EOF
+# Configurações básicas
+node.startup = automatic
+node.session.auth.authmethod = None
+node.session.timeo.replacement_timeout = 120
+
+# Configurações de timeout
 node.conn[0].timeo.login_timeout = 15
 node.conn[0].timeo.logout_timeout = 15
+node.conn[0].timeo.noop_out_interval = 5
+node.conn[0].timeo.noop_out_timeout = 5
+
+# Configurações de sessão
 node.session.initial_login_retry_max = 8
 node.session.cmds_max = 128
 node.session.queue_depth = 32
 node.session.nr_sessions = 1
+
+# Configurações de performance
+node.session.iscsi.InitialR2T = No
+node.session.iscsi.ImmediateData = Yes
+node.session.iscsi.FirstBurstLength = 262144
+node.session.iscsi.MaxBurstLength = 16776192
+node.conn[0].iscsi.MaxRecvDataSegmentLength = 262144
 EOF
+
+# Verificar a configuração
+echo "Verificando arquivo de configuração iSCSI..."
+if ! sudo iscsid -c /etc/iscsi/iscsid.conf -f; then
+    echo "❌ ERRO: Arquivo de configuração iSCSI inválido"
+    echo "Conteúdo do arquivo:"
+    cat /etc/iscsi/iscsid.conf
+    exit 1
+fi
 
 # Iniciar serviços iSCSI
 echo "Iniciando serviços iSCSI..."
@@ -131,6 +179,26 @@ if ! wait_for_iscsid; then
     echo "ERRO: iscsid não ficou operacional"
     echo "Status do serviço:"
     systemctl status iscsid --no-pager
+    
+    echo -e "\nDiagnóstico adicional:"
+    echo "1. Verificando logs do sistema..."
+    journalctl -u iscsid --since "5 minutes ago" --no-pager
+    
+    echo -e "\n2. Verificando configuração do iscsid..."
+    cat /etc/iscsi/iscsid.conf
+    
+    echo -e "\n3. Verificando permissões dos arquivos..."
+    ls -la /etc/iscsi/
+    
+    echo -e "\n4. Verificando processos iscsid..."
+    ps aux | grep iscsid
+    
+    echo -e "\n5. Verificando portas em uso..."
+    ss -tuln | grep 3260
+    
+    echo -e "\n6. Verificando módulos do kernel..."
+    lsmod | grep iscsi
+    
     exit 1
 fi
 
