@@ -37,7 +37,7 @@ fi
 print_header "3) Criando recurso Pacemaker 'test-dlm'"
 if sudo pcs resource show test-dlm &>/dev/null; then
   print_warning "Recurso 'test-dlm' já existe; removendo anterior"
-  sudo pcs resource delete test-dlm --quiet || true
+  sudo pcs resource delete test-dlm || true
   # Aguardar remoção
   for i in {1..6}; do
     if ! sudo pcs resource show test-dlm &>/dev/null; then
