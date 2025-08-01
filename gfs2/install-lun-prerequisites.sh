@@ -464,6 +464,9 @@ detect_available_devices() {
         done
         processed_devices+=("$real_device")
         
+        # Debug: mostrar device sendo processado
+        print_info "Verificando device: $device (real: $real_device)"
+        
         if [[ -b "$device" ]]; then
             local size
             size=$(lsblk -dn -o SIZE "$device" 2>/dev/null || echo "N/A")
@@ -498,9 +501,21 @@ detect_available_devices() {
     # Procurar por devices multipath
     print_info "Procurando devices multipath..."
     shopt -s nullglob
+    
+    # Debug: listar todos os devices em /dev/mapper
+    print_info "Conteúdo de /dev/mapper:"
+    ls -l /dev/mapper/
+    
+    # Debug: mostrar saída do comando multipath -ll
+    print_info "Saída do multipath -ll:"
+    multipath -ll
+    
     for device in /dev/mapper/* /dev/mpath/*; do
         if [[ -b "$device" && "$device" != "/dev/mapper/control" && ! "$device" =~ ^/dev/mapper/dm-[0-9]+$ ]]; then
+            print_info "Verificando device multipath: $device"
             check_and_add_device "$device" "multipath"
+        else
+            print_info "Ignorando device: $device"
         fi
     done
     
@@ -523,6 +538,37 @@ detect_available_devices() {
     for device in /dev/sd[b-z]; do
         check_and_add_device "$device" "physical"
     done
+    
+    if [[ ${#devices[@]} -eq 0 ]]; then
+        print_error "Nenhum device disponível encontrado"
+        return 1
+    fi
+    
+    # Debug: mostrar todos os devices encontrados
+    print_info "Devices candidatos detectados:"
+    for i in "${!devices[@]}"; do
+        echo "$((i + 1)). ${devices[i]}"
+    done
+    
+    # Selecionar device automaticamente ou manualmente
+    local selected_device
+    if [[ ${#devices[@]} -eq 1 ]]; then
+        selected_device=$(echo "${devices[0]}" | awk '{print $1}')
+        print_info "Selecionando automaticamente único device: $selected_device"
+    else
+        echo ""
+        read -p "Selecione o device para criar VG compartilhado (número): " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#devices[@]} ]]; then
+            selected_device=$(echo "${devices[$((choice - 1))]}" | awk '{print $1}')
+            print_info "Device selecionado: $selected_device"
+        else
+            print_error "Seleção inválida"
+            return 1
+        fi
+    fi
+    
+    echo "$selected_device"
+    return 0
 
 configure_lvm_cluster() {
     print_header "⚙️  Configurando LVM para Cluster"
