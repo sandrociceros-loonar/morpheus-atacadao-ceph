@@ -4,16 +4,14 @@
 
 set -e
 
-# 1. Atualizar repositórios e instalar pacotes necessários
-echo "Instalando pacotes de cluster e GFS2..."
+echo "=== 1. Atualizar repositórios e instalar pacotes necessários ==="
 apt update
 DEBIAN_FRONTEND=noninteractive apt install -y \
   open-iscsi multipath-tools \
   gfs2-utils dlm-controld pcs \
   pacemaker corosync
 
-# 2. Configurar multipath para Fibre Channel
-echo "Configurando multipath..."
+echo "=== 2. Configurar multipath para Fibre Channel ==="
 cat > /etc/multipath.conf <<'EOF'
 defaults {
     user_friendly_names yes
@@ -40,37 +38,44 @@ devices {
     }
 }
 EOF
-
 systemctl restart multipath-tools
 multipath -F
 multipath -r
 
-# 3. Habilitar e iniciar serviços de clustering
-echo "Habilitando serviços de cluster..."
-# Definir senha padrão do usuário hacluster (ajuste conforme política de senha)
+echo "=== 3. Habilitar e iniciar serviços de cluster ==="
+echo "Definindo senha do usuário 'hacluster' (ajuste conforme política)..."
 echo "hacluster:clusterPass1" | chpasswd
+
 systemctl enable --now pcsd
 systemctl enable --now corosync
 systemctl enable --now pacemaker
-systemctl enable --now dlm
-systemctl enable --now corosync
-systemctl enable --now pacemaker
 
-# 4. Configurar DLM
-echo "Configurando DLM..."
-cat > /etc/default/dlm <<'EOF'
-DLM_CONTROLD_OPTS="-T 60"
+echo "=== 4. Configurar override para dlm.service (remover opção -T) ==="
+mkdir -p /etc/systemd/system/dlm.service.d
+cat > /etc/systemd/system/dlm.service.d/override.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/dlm_controld --foreground
 EOF
+
+systemctl daemon-reload
+systemctl enable dlm
 systemctl restart dlm
 
-# 5. Montagem automática de GFS2 (opcional, Morpheus faz após criar datastore)
-# Aqui apenas garantimos que gfs2-utils esteja presente
-echo "Preparação concluída. Verifique configuração de hosts no /etc/hosts e fencing antes de criar datastore."
+echo "=== 5. Configurar DLM_DEFAULTS opcionalmente ==="
+cat > /etc/default/dlm <<'EOF'
+# Arquivo de configuração do DLM (sem -T)
+# Sem opções adicionais necessárias para Ubuntu 22.04+
+EOF
 
-# 6. Exibir status geral
-echo
-echo "=== Status dos serviços ==="
+echo "=== 6. Verificações Finais ==="
+echo "Status dos serviços:"
 systemctl is-active corosync pacemaker dlm multipath-tools
+
 echo
-echo "=== Dispositivos multipath detectados ==="
+echo "Dispositivos multipath detectados:"
 multipath -ll
+
+echo
+echo "Verifique o status do cluster (após formar quorum):"
+echo "  crm status  # requer configuração de fencing e quorum via pcs"
