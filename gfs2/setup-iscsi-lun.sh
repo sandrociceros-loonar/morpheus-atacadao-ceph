@@ -14,24 +14,23 @@ MULTIPATH_ALIAS="fc-lun-cluster"
 
 echo "Configurando iSCSI/Multipath - Versão Corrigida..."
 
-# CORREÇÃO: Função correta para aguardar iscsid
+# Função para aguardar iscsid
 wait_for_iscsid() {
     echo "Aguardando iscsid estar completamente operacional..."
     local max_attempts=15
     local attempt=1
     
     while [[ $attempt -le $max_attempts ]]; do
-        # CORREÇÃO: Teste correto - verificar se serviço está ativo
-        if systemctl is-active --quiet iscsid; then
-            # Teste adicional: tentar comunicar com iscsid
-            if sudo iscsiadm -m iface >/dev/null 2>&1; then
+        if systemctl is-active --quiet iscsid && systemctl is-active --quiet open-iscsi; then
+            # Verifica se o socket está respondendo
+            if sudo iscsiadm -m discovery --version >/dev/null 2>&1; then
                 echo "✅ iscsid está operacional (tentativa $attempt)"
                 return 0
             fi
         fi
         
         echo "Aguardando iscsid... ($attempt/$max_attempts)"
-        sleep 3
+        sleep 5
         ((attempt++))
     done
     
@@ -78,19 +77,25 @@ echo "InitiatorName=$INITIATOR" | sudo tee /etc/iscsi/initiatorname.iscsi >/dev/
 
 # Configuração básica do iSCSI
 sudo tee /etc/iscsi/iscsid.conf >/dev/null <<EOF
-node.startup = manual
+node.startup = automatic
+node.session.auth.authmethod = CHAP
 node.session.auth.authmethod = None
-discovery.sendtargets.auth.authmethod = None
-node.conn.timeo.login_timeout = 15
 node.session.timeo.replacement_timeout = 120
+node.conn.timeo.login_timeout = 15
+node.conn.timeo.logout_timeout = 15
+node.session.initial_login_retry_max = 8
 EOF
 
-# Iniciar iscsid
-echo "Iniciando iscsid..."
-sudo systemctl enable iscsid
+# Iniciar serviços iSCSI
+echo "Iniciando serviços iSCSI..."
+sudo systemctl enable iscsid open-iscsi
+sudo systemctl stop iscsid open-iscsi >/dev/null 2>&1 || true
+sudo systemctl daemon-reload
 sudo systemctl start iscsid
+sudo systemctl start open-iscsi
+sleep 5
 
-# AGUARDAR iscsid com teste corrigido
+# Aguardar iscsid com teste corrigido
 if ! wait_for_iscsid; then
     echo "ERRO: iscsid não ficou operacional"
     echo "Status do serviço:"
