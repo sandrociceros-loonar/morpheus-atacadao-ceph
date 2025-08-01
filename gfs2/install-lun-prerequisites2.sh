@@ -4,7 +4,7 @@
 # DESCRIÇÃO: Instalação de pré-requisitos para GFS2 Enterprise
 #            + validação e auto-instalação de kernel com suporte a DLM
 #            + criação de FS GFS2 e montagem automática
-# VERSÃO: 2.3 - Ajuste de detecção de suporte a DLM
+# VERSÃO: 2.4 - Correção de ordem de criação de recursos
 # AUTOR: DevOps Team
 # ============================================================================
 
@@ -54,7 +54,7 @@ check_prerequisites() {
 }
 
 # ----------------------------------------------------------------------------
-# 2) Garantir kernel com suporte a DLM (nova lógica)
+# 2) Garantir kernel com suporte a DLM
 ensure_dlm_kernel_support() {
   print_header "🔍 Verificando suporte do kernel ao DLM"
   if sudo modprobe dlm &>/dev/null && lsmod | grep -q '^dlm'; then
@@ -116,9 +116,32 @@ configure_cluster_properties() {
 configure_cluster_resources() {
   print_info "Configurando recursos DLM e lvmlockd..."
   sleep 15
-  sudo pcs resource show dlm-clone &>/dev/null || sudo pcs resource create dlm systemd:dlm op monitor interval=60s on-fail=fence clone interleave=true ordered=true && print_success "DLM criado"
-  sudo pcs resource show lvmlockd-clone &>/dev/null || { sudo pcs resource create lvmlockd systemd:lvmlockd op monitor interval=60s on-fail=fence clone interleave=true ordered=true && print_success "lvmlockd criado"; sudo pcs constraint order start dlm-clone then lvmlockd-clone; sudo pcs constraint colocation add lvmlockd-clone with dlm-clone; }
-  print_info "Aguardando recursos (60s)"; sleep 60
+  
+  # Criar recurso DLM
+  if ! sudo pcs resource show dlm-clone &>/dev/null; then
+    print_info "Criando recurso DLM..."
+    sudo pcs resource create dlm systemd:dlm op monitor interval=60s on-fail=fence clone interleave=true ordered=true
+    print_success "Recurso DLM criado"
+  else
+    print_success "Recurso DLM já existe"
+  fi
+  
+  # Criar recurso lvmlockd
+  if ! sudo pcs resource show lvmlockd-clone &>/dev/null; then
+    print_info "Criando recurso lvmlockd..."
+    sudo pcs resource create lvmlockd systemd:lvmlockd op monitor interval=60s on-fail=fence clone interleave=true ordered=true
+    print_success "Recurso lvmlockd criado"
+    
+    # Configurar dependências
+    sudo pcs constraint order start dlm-clone then lvmlockd-clone
+    sudo pcs constraint colocation add lvmlockd-clone with dlm-clone
+    print_success "Dependências configuradas"
+  else
+    print_success "Recurso lvmlockd já existe"
+  fi
+  
+  print_info "Aguardando recursos ficarem ativos (60s)..."
+  sleep 60
 }
 
 # ----------------------------------------------------------------------------
@@ -127,24 +150,46 @@ configure_enterprise_cluster() {
   print_header "🏢 Configurando Cluster Enterprise"
   local role=$(detect_node_role)
   [[ "$role" == "unknown" ]] && error_exit "Papel do nó desconhecido"
+  
   if sudo pcs status &>/dev/null; then
-    print_warning "Cluster já existe"; sudo pcs status; return
+    print_warning "Cluster já existe"
+    sudo pcs status
+    return 0
   fi
+  
   if [[ "$role" == "primary" ]]; then
+    print_info "Configurando como nó primário..."
     sudo systemctl enable --now pcsd
-    ssh "$NODE2_NAME" "sudo systemctl enable --now pcsd" &>/dev/null && print_success "pcsd ativos"
+    
+    print_info "Verificando pcsd no nó secundário..."
+    ssh "$NODE2_NAME" "sudo systemctl enable --now pcsd" &>/dev/null && print_success "pcsd ativo em ambos nós"
     sleep 10
+    
+    print_info "Autenticando nós..."
     echo "hacluster" | sudo pcs host auth "$NODE1_NAME" "$NODE2_NAME" -u hacluster
+    
+    print_info "Criando cluster..."
     sudo pcs cluster setup "$CLUSTER_NAME" "$NODE1_NAME" addr="$NODE1_IP" "$NODE2_NAME" addr="$NODE2_IP"
-    sudo pcs cluster enable --all --now; sleep 30
+    
+    print_info "Iniciando cluster..."
+    sudo pcs cluster enable --all
+    sudo pcs cluster start --all
+    sleep 30
+    
     configure_cluster_properties
     configure_cluster_resources
+    
+    print_info "Status do cluster:"
     sudo pcs status
   else
-    print_info "Aguardando configuração pelo primário..."
+    print_info "Aguardando configuração pelo nó primário..."
     local t=0
-    until sudo pcs status &>/dev/null || ((t>=180)); do sleep 10; ((t+=10)); done
-    sudo pcs status || error_exit "Cluster não detectado"
+    until sudo pcs status &>/dev/null || ((t>=180)); do 
+      echo "Aguardando... ${t}s"
+      sleep 10
+      ((t+=10))
+    done
+    sudo pcs status || error_exit "Cluster não detectado após timeout"
   fi
 }
 
@@ -158,9 +203,10 @@ detect_available_devices() {
     local real=$(readlink -f "$p")
     [[ " ${seen[*]} " == *" $real "* ]] && continue
     seen+=("$real")
-    [[ -n $(lsblk -dn -o MOUNTPOINT "$real") ]] && continue
+    [[ -n $(lsblk -dn -o MOUNTPOINT "$real" 2>/dev/null) ]] && continue
     pvs "$real" &>/dev/null && continue
-    devices+=("$real"); print_success "Candidate LUN: $real"
+    devices+=("$real")
+    print_success "LUN candidato: $real"
   done
   [[ ${#devices[@]} -gt 0 ]] || error_exit "Nenhum LUN detectado"
   if [[ ${#devices[@]} -eq 1 ]]; then
@@ -177,22 +223,62 @@ detect_available_devices() {
 
 configure_lvm_cluster() {
   print_header "⚙️  Configurando LVM Cluster-aware"
-  local max=30 t=0
-  until sudo pcs status | grep -q "dlm.*Started" || ((t>=max)); do sleep 2; ((t+=2)); done
-  sudo pcs status | grep -q "dlm.*Started" || error_exit "DLM não iniciou"
+  
+  # Verificar se recursos existem primeiro
+  if ! sudo pcs resource show dlm-clone &>/dev/null; then
+    print_error "Recurso DLM não existe. Execute primeiro a configuração do cluster."
+    return 1
+  fi
+  
+  if ! sudo pcs resource show lvmlockd-clone &>/dev/null; then
+    print_error "Recurso lvmlockd não existe. Execute primeiro a configuração do cluster."
+    return 1
+  fi
+  
+  # Aguardar DLM iniciar
+  print_info "Aguardando DLM ficar ativo..."
+  local max=60 t=0
+  until sudo pcs status | grep -q "dlm.*Started" || ((t>=max)); do 
+    echo -n "."
+    sleep 2
+    ((t+=2))
+  done
+  echo ""
+  sudo pcs status | grep -q "dlm.*Started" || error_exit "DLM não iniciou após ${max}s"
+  print_success "DLM ativo"
+  
+  # Aguardar lvmlockd iniciar
+  print_info "Aguardando lvmlockd ficar ativo..."
   t=0
-  until sudo pcs status | grep -q "lvmlockd.*Started" || ((t>=max)); do sleep 2; ((t+=2)); done
-  sudo pcs status | grep -q "lvmlockd.*Started" || error_exit "lvmlockd não iniciou"
+  until sudo pcs status | grep -q "lvmlockd.*Started" || ((t>=max)); do 
+    echo -n "."
+    sleep 2
+    ((t+=2))
+  done
+  echo ""
+  sudo pcs status | grep -q "lvmlockd.*Started" || error_exit "lvmlockd não iniciou após ${max}s"
+  print_success "lvmlockd ativo"
+  
   local dev=$(detect_available_devices)
   print_info "Usando device: $dev"
+  
+  # Configurar lvm.conf
   sudo sed -i '/use_lvmlockd/s/0/1/' /etc/lvm/lvm.conf || true
-
+  
   if ! sudo vgs "$VG_NAME" &>/dev/null; then
+    print_info "Criando Physical Volume..."
     sudo pvcreate -y "$dev"
+    
+    print_info "Criando Volume Group cluster-aware..."
     sudo vgcreate --shared --locktype dlm "$VG_NAME" "$dev"
+    
+    print_info "Iniciando locks..."
     sudo vgchange --lockstart "$VG_NAME"
+    
+    print_info "Criando Logical Volume..."
     sudo lvcreate -n "$LV_NAME" -l100%FREE "$VG_NAME"
   fi
+  
   sudo vgchange -ay "$VG_NAME"
   print_success "LVM configurado: /dev/$VG_NAME/$LV_NAME"
 }
@@ -202,16 +288,26 @@ configure_lvm_cluster() {
 create_and_mount_gfs2() {
   print_header "🗂️  Criando FS GFS2 e Montando"
   sudo mkdir -p "$MOUNT_POINT"
-  if ! sudo blkid /dev/$VG_NAME/$LV_NAME | grep -q gfs2; then
+  
+  if ! sudo blkid /dev/$VG_NAME/$LV_NAME 2>/dev/null | grep -q gfs2; then
+    print_info "Criando filesystem GFS2..."
     sudo mkfs.gfs2 -p lock_nolock -t "${CLUSTER_NAME}:gfs2" /dev/$VG_NAME/$LV_NAME
     print_success "FS GFS2 criado em /dev/$VG_NAME/$LV_NAME"
   else
     print_info "FS GFS2 já existe em /dev/$VG_NAME/$LV_NAME"
   fi
-  grep -q "/dev/$VG_NAME/$LV_NAME" /etc/fstab || \
+  
+  if ! grep -q "/dev/$VG_NAME/$LV_NAME" /etc/fstab; then
     echo "/dev/$VG_NAME/$LV_NAME  $MOUNT_POINT  gfs2  defaults  0  0" | sudo tee -a /etc/fstab
-  sudo mount "$MOUNT_POINT"
-  print_success "Volume montado em $MOUNT_POINT"
+    print_success "Entrada adicionada ao /etc/fstab"
+  fi
+  
+  if ! mountpoint -q "$MOUNT_POINT"; then
+    sudo mount "$MOUNT_POINT"
+    print_success "Volume montado em $MOUNT_POINT"
+  else
+    print_info "Volume já montado em $MOUNT_POINT"
+  fi
 }
 
 # ----------------------------------------------------------------------------
@@ -245,6 +341,7 @@ EOF
 main() {
   print_header "🚀 Iniciando Instalação GFS2 Enterprise + Mount"
   print_info "Nó: $(get_current_hostname) | IP: $(ip route get 8.8.8.8 2>/dev/null | awk '/src/ {print $7}')"
+  
   check_prerequisites
   ensure_dlm_kernel_support
   check_dlm_module
@@ -253,13 +350,16 @@ main() {
   configure_lvm_cluster
   create_and_mount_gfs2
   configure_corosync
+  
   print_header "✅ Instalação Concluída com Sucesso!"
+  print_success "Volume GFS2 montado em $MOUNT_POINT"
+  print_info "Execute 'df -h $MOUNT_POINT' para verificar"
 }
 
 # ----------------------------------------------------------------------------
 # Execução
 case "${1:-}" in
   --help|-h)  echo "Uso: $0 [--help] [--version]" && exit 0 ;;
-  --version)  echo "Versão 2.3" && exit 0 ;;
+  --version)  echo "Versão 2.4" && exit 0 ;;
   *)          main ;;
 esac
