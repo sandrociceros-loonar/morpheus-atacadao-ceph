@@ -3,8 +3,8 @@
 # ============================================================================
 # SCRIPT: setup-iscsi-lun.sh
 # DESCRIÇÃO: Configuração automática de conectividade iSCSI com discovery
-# VERSÃO: 2.0 - Discovery Automático e Configuração Enterprise
-# AUTOR: DevOps Team
+# VERSÃO: 2.1 - Discovery Automático com Seleção de Target IP
+# AUTOR: sandro.cicero@loonar.cloud
 # ============================================================================
 
 # Configurações globais
@@ -51,6 +51,185 @@ print_info() {
 error_exit() {
     print_error "$1"
     exit 1
+}
+
+# ============================================================================
+# SELEÇÃO DO TARGET iSCSI
+# ============================================================================
+
+prompt_for_target_ip() {
+    print_header "🎯 Configuração do Servidor iSCSI Target"
+    
+    print_info "Configure o endereço do servidor iSCSI Target:"
+    echo ""
+    
+    # Mostrar opções disponíveis
+    echo "Opções disponíveis:"
+    echo "  1. Usar endereço padrão: $DEFAULT_TGT_IP"
+    echo "  2. Informar endereço personalizado"
+    echo "  3. Auto-detectar na rede local"
+    echo ""
+    
+    while true; do
+        read -p "Selecione uma opção [1-3]: " choice
+        
+        case "$choice" in
+            1)
+                local target_ip="$DEFAULT_TGT_IP"
+                print_success "Usando endereço padrão: $target_ip"
+                break
+                ;;
+            2)
+                echo ""
+                while true; do
+                    read -p "Digite o endereço IP do servidor iSCSI: " custom_ip
+                    
+                    # Validar formato básico de IP
+                    if [[ $custom_ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+                        # Validar ranges válidos
+                        local valid=true
+                        IFS='.' read -ra ADDR <<< "$custom_ip"
+                        for i in "${ADDR[@]}"; do
+                            if [[ $i -lt 0 ]] || [[ $i -gt 255 ]]; then
+                                valid=false
+                                break
+                            fi
+                        done
+                        
+                        if [[ $valid == true ]]; then
+                            local target_ip="$custom_ip"
+                            print_success "Usando endereço personalizado: $target_ip"
+                            break 2
+                        else
+                            print_error "Endereço IP inválido. Use formato: xxx.xxx.xxx.xxx"
+                        fi
+                    else
+                        print_error "Formato inválido. Use formato: xxx.xxx.xxx.xxx"
+                    fi
+                done
+                ;;
+            3)
+                print_info "🔍 Auto-detectando servidores iSCSI na rede local..."
+                local detected_targets=($(auto_detect_iscsi_servers))
+                
+                if [[ ${#detected_targets[@]} -eq 0 ]]; then
+                    print_warning "Nenhum servidor iSCSI detectado na rede local"
+                    print_info "Tente a opção 1 ou 2"
+                    continue
+                elif [[ ${#detected_targets[@]} -eq 1 ]]; then
+                    local target_ip="${detected_targets[0]}"
+                    print_success "Servidor detectado automaticamente: $target_ip"
+                    break
+                else
+                    echo ""
+                    print_info "Múltiplos servidores iSCSI detectados:"
+                    for i in "${!detected_targets[@]}"; do
+                        echo "  $((i + 1)). ${detected_targets[i]}"
+                    done
+                    echo ""
+                    
+                    while true; do
+                        read -p "Selecione um servidor (número): " server_choice
+                        if [[ "$server_choice" =~ ^[0-9]+$ ]] && [[ "$server_choice" -ge 1 ]] && [[ "$server_choice" -le ${#detected_targets[@]} ]]; then
+                            local target_ip="${detected_targets[$((server_choice - 1))]}"
+                            print_success "Servidor selecionado: $target_ip"
+                            break 2
+                        else
+                            print_error "Seleção inválida"
+                        fi
+                    done
+                fi
+                ;;
+            *)
+                print_error "Opção inválida. Selecione 1, 2 ou 3"
+                ;;
+        esac
+    done
+    
+    # Confirmar conectividade antes de prosseguir
+    print_info "Testando conectividade com $target_ip..."
+    
+    if ping -c 2 "$target_ip" &>/dev/null; then
+        print_success "Conectividade confirmada com $target_ip"
+        
+        # Testar se porta iSCSI está acessível
+        if timeout 5s bash -c "</dev/tcp/$target_ip/$ISCSI_PORT" &>/dev/null; then
+            print_success "Porta iSCSI ($ISCSI_PORT) acessível"
+        else
+            print_warning "Porta iSCSI ($ISCSI_PORT) não está acessível"
+            echo ""
+            read -p "Continuar mesmo assim? [s/N]: " continue_anyway
+            if [[ "$continue_anyway" != "s" && "$continue_anyway" != "S" ]]; then
+                print_info "Operação cancelada pelo usuário"
+                exit 0
+            fi
+        fi
+    else
+        print_warning "Não foi possível conectar com $target_ip"
+        echo ""
+        read -p "Continuar mesmo assim? [s/N]: " continue_anyway
+        if [[ "$continue_anyway" != "s" && "$continue_anyway" != "S" ]]; then
+            print_info "Operação cancelada pelo usuário"
+            exit 0
+        fi
+    fi
+    
+    echo ""
+    print_info "📋 Configuração confirmada:"
+    print_info "   • Servidor iSCSI Target: $target_ip"
+    print_info "   • Porta: $ISCSI_PORT"
+    echo ""
+    
+    read -p "Pressione Enter para continuar com a configuração..."
+    
+    echo "$target_ip"
+}
+
+auto_detect_iscsi_servers() {
+    local network_base
+    local current_ip
+    
+    # Obter IP atual e calcular rede base
+    current_ip=$(ip route get 8.8.8.8 2>/dev/null | awk '/src/ {print $7}' || echo "")
+    
+    if [[ -n "$current_ip" ]]; then
+        # Extrair os primeiros 3 octetos para scan da rede
+        network_base=$(echo "$current_ip" | cut -d'.' -f1-3)
+        
+        print_info "Escaneando rede $network_base.0/24 por servidores iSCSI..."
+        
+        local detected=()
+        
+        # Scan básico dos IPs mais comuns para servers
+        local common_server_ips=(1 10 20 50 100 200 250 254)
+        
+        for ip_suffix in "${common_server_ips[@]}"; do
+            local test_ip="$network_base.$ip_suffix"
+            
+            # Pular IP atual
+            if [[ "$test_ip" == "$current_ip" ]]; then
+                continue
+            fi
+            
+            # Testar conectividade e porta iSCSI
+            if timeout 2s bash -c "</dev/tcp/$test_ip/$ISCSI_PORT" &>/dev/null; then
+                # Verificar se realmente é servidor iSCSI fazendo discovery
+                if timeout 5s iscsiadm -m discovery -t st -p "$test_ip:$ISCSI_PORT" &>/dev/null; then
+                    detected+=("$test_ip")
+                    print_info "   ✅ Servidor iSCSI encontrado: $test_ip"
+                fi
+            fi
+        done
+        
+        if [[ ${#detected[@]} -eq 0 ]]; then
+            print_info "   ❌ Nenhum servidor iSCSI detectado na rede local"
+        fi
+        
+        echo "${detected[@]}"
+    else
+        print_warning "Não foi possível determinar rede local para auto-detecção"
+        echo ""
+    fi
 }
 
 # ============================================================================
@@ -122,18 +301,9 @@ check_prerequisites() {
 # ============================================================================
 
 discover_iscsi_targets() {
-    local tgt_ip="${1:-$DEFAULT_TGT_IP}"
+    local tgt_ip="$1"
     
     print_header "🔍 Discovery Automático de Targets iSCSI"
-    
-    print_info "Verificando conectividade com servidor iSCSI..."
-    if ! ping -c 2 "$tgt_ip" &>/dev/null; then
-        print_error "Não foi possível conectar com o servidor iSCSI: $tgt_ip"
-        print_info "Verifique conectividade de rede ou informe IP correto"
-        return 1
-    fi
-    
-    print_success "Conectividade com $tgt_ip verificada"
     
     print_info "Descobrindo targets iSCSI disponíveis em $tgt_ip:$ISCSI_PORT..."
     
@@ -148,6 +318,7 @@ discover_iscsi_targets() {
         echo "   • Servidor iSCSI não está rodando"
         echo "   • Firewall bloqueando porta $ISCSI_PORT"
         echo "   • IP incorreto: $tgt_ip"
+        echo "   • ACL restritivo no servidor Target"
         return 1
     fi
     
@@ -530,10 +701,7 @@ test_device_performance() {
 main() {
     print_header "🚀 Setup iSCSI LUN - Configuração Automática"
     
-    local tgt_ip="${1:-$DEFAULT_TGT_IP}"
-    
     print_info "Iniciando configuração iSCSI/Multipath..."
-    print_info "Servidor iSCSI Target: $tgt_ip"
     
     # Detectar informações do nó
     detect_node_info
@@ -541,6 +709,12 @@ main() {
     # Verificar pré-requisitos
     if ! check_prerequisites; then
         error_exit "Falha na verificação de pré-requisitos"
+    fi
+    
+    # Solicitar endereço do Target ao usuário
+    local tgt_ip
+    if ! tgt_ip=$(prompt_for_target_ip); then
+        error_exit "Falha na configuração do endereço do Target"
     fi
     
     # Discovery automático de targets
@@ -610,31 +784,31 @@ main() {
 # Verificar argumentos
 case "${1:-}" in
     --help|-h)
-        echo "Uso: $0 [IP_DO_SERVIDOR_TGT]"
+        echo "Uso: $0"
         echo ""
-        echo "Configuração automática de conectividade iSCSI com discovery automático"
-        echo ""
-        echo "Parâmetros:"
-        echo "  IP_DO_SERVIDOR_TGT    IP do servidor iSCSI Target (padrão: $DEFAULT_TGT_IP)"
-        echo ""
-        echo "Exemplos:"
-        echo "  $0                    # Usar IP padrão ($DEFAULT_TGT_IP)"
-        echo "  $0 192.168.1.100      # Usar IP específico"
+        echo "Configuração automática de conectividade iSCSI com seleção interativa do Target"
         echo ""
         echo "Este script:"
+        echo "  • Solicita ao usuário o endereço do servidor iSCSI Target"
+        echo "  • Oferece opções: endereço padrão, personalizado ou auto-detecção"
         echo "  • Descobre automaticamente targets iSCSI disponíveis"
         echo "  • Configura initiator iSCSI com parâmetros otimizados"
         echo "  • Estabelece conexão com o target selecionado"
         echo "  • Configura multipath com alias personalizado"
         echo "  • Valida configuração e testa acesso ao dispositivo"
+        echo ""
+        echo "Melhorias na versão 2.1:"
+        echo "  • Prompt interativo para seleção do Target IP"
+        echo "  • Auto-detecção de servidores iSCSI na rede"
+        echo "  • Validação de IP e conectividade antes de prosseguir"
         exit 0
         ;;
     --version)
-        echo "setup-iscsi-lun.sh versão 2.0 - Discovery Automático"
+        echo "setup-iscsi-lun.sh versão 2.1 - Discovery com Seleção de Target IP"
         exit 0
         ;;
     *)
         # Execução normal
-        main "$@"
+        main
         ;;
 esac
