@@ -675,25 +675,69 @@ configure_lvm_cluster() {
         if [[ "$lock_type" != "dlm" ]]; then
             print_info "Convertendo Volume Group para modo cluster DLM..."
             
-            # Parar locks se existirem
+            # Forçar cleanup de locks
+            print_info "Limpando locks existentes..."
             sudo vgchange --lockstop "$vg_name" 2>/dev/null || true
+            sudo lvmlockctl --stop 2>/dev/null || true
+            sudo systemctl restart lvmlockd 2>/dev/null || true
+            sleep 5
             
-            # Converter para DLM
-            if sudo vgchange --locktype dlm "$vg_name"; then
+            # Desativar VG primeiro
+            print_info "Desativando Volume Group temporariamente..."
+            sudo vgchange -an "$vg_name" || true
+            
+            # Converter para DLM com força
+            print_info "Tentando converter para DLM..."
+            if sudo vgchange --locktype dlm "$vg_name" --yes; then
                 print_success "Volume Group convertido para modo cluster"
             else
                 print_error "Falha ao converter Volume Group para modo cluster"
-                return 1
+                print_info "Tentando método alternativo..."
+                
+                # Método alternativo: remover e recriar metadados de lock
+                if sudo vgchange --locktype none "$vg_name" && \
+                   sudo vgchange --locktype dlm "$vg_name" --yes; then
+                    print_success "Volume Group convertido para modo cluster (método alternativo)"
+                else
+                    print_error "Falha ao converter Volume Group para modo cluster"
+                    return 1
+                fi
             fi
         fi
         
-        # Iniciar locks
-        if sudo vgchange --lockstart "$vg_name"; then
-            print_success "Locks do Volume Group iniciados"
-        else
-            print_warning "Falha ao iniciar locks - continuando sem locks distribuídos"
+        # Iniciar locks com retry
+        print_info "Iniciando locks do Volume Group..."
+        local max_retries=3
+        local retry_count=0
+        local success=false
+        
+        while [[ $retry_count -lt $max_retries ]]; do
+            if sudo vgchange --lockstart "$vg_name"; then
+                print_success "Locks do Volume Group iniciados"
+                success=true
+                break
+            else
+                ((retry_count++))
+                print_warning "Tentativa $retry_count de $max_retries falhou"
+                print_info "Aguardando 5 segundos antes de tentar novamente..."
+                sleep 5
+                
+                # Tentar reiniciar serviços relevantes
+                sudo systemctl restart lvmlockd 2>/dev/null || true
+                sudo vgchange --lockstop "$vg_name" 2>/dev/null || true
+            fi
+        done
+        
+        if [[ "$success" != "true" ]]; then
+            print_warning "Falha ao iniciar locks após $max_retries tentativas"
+            print_info "Tentando fallback para modo local..."
             # Converter para modo local como fallback
-            sudo vgchange --locktype none "$vg_name" 2>/dev/null || true
+            if sudo vgchange --locktype none "$vg_name" 2>/dev/null; then
+                print_warning "Convertido para modo local (sem locks distribuídos)"
+            else
+                print_error "Falha ao converter para modo local"
+                return 1
+            fi
         fi
         
         # Ativar Volume Group
