@@ -17,7 +17,6 @@ listar_multipaths() {
 
 listar_usuarios() {
   echo "Usuários do sistema disponíveis:"
-  # Filtra usuários com UID>=1000 (usuários normais)
   awk -F: '$3>=1000 && $3<65534 { print NR ": " $1 }' /etc/passwd
 }
 
@@ -60,8 +59,13 @@ read -p "Informe o diretório de montagem [${DEFAULT_MOUNT_POINT}]: " MOUNT_POIN
 MOUNT_POINT="${MOUNT_POINT:-$DEFAULT_MOUNT_POINT}"
 mkdir -p "$MOUNT_POINT"
 
-echo "==> Criando XFS em $MAPPATH..."
-mkfs.xfs -f "$MAPPATH"
+# Passo: Criar filesystem apenas se ainda não montado
+if mount | grep -q "$MAPPATH"; then
+  echo "==> Dispositivo $MAPPATH já montado, pulando mkfs."
+else
+  echo "==> Criando XFS em $MAPPATH..."
+  mkfs.xfs -f "$MAPPATH"
+fi
 
 FSTAB_LINE="$MAPPATH  $MOUNT_POINT  xfs  defaults,_netdev  0 0"
 if ! grep -qF "$WWID" /etc/fstab; then
@@ -71,14 +75,18 @@ else
   echo "Entrada já existe em /etc/fstab."
 fi
 
-echo "==> Montando $MOUNT_POINT..."
-mount "$MOUNT_POINT"
+if mount | grep -q "$MOUNT_POINT"; then
+  echo "==> $MOUNT_POINT já está montado."
+else
+  echo "==> Montando $MOUNT_POINT..."
+  mount "$MOUNT_POINT"
+fi
 
 echo "==> Ajustando permissões para $USER_AG..."
 chown -R "${USER_AG}:${USER_AG}" "$MOUNT_POINT"
 chmod -R 770 "$MOUNT_POINT"
 
-echo "==> Reiniciando serviço do agente (usuário $USER_AG)..."
+echo "==> Reiniciando serviço do agente..."
 SERVICE_NAME="morpheus-agent"
 if systemctl list-units --full -all | grep -q "${SERVICE_NAME}"; then
   systemctl restart "${SERVICE_NAME}"
