@@ -306,7 +306,6 @@ defaults {
     failback immediate
     rr_weight uniform
     no_path_retry fail
-    queue_without_daemon no
     dev_loss_tmo infinity
     fast_io_fail_tmo 5
     features "0"
@@ -335,7 +334,6 @@ devices {
         no_path_retry fail
         dev_loss_tmo infinity
         fast_io_fail_tmo 5
-        queue_without_daemon no
         product_blacklist "LUNZ"
     }
 }
