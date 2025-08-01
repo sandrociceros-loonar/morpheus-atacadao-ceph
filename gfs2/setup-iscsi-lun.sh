@@ -3,6 +3,7 @@
 # ============================================================================
 # SCRIPT: setup-iscsi-lun.sh
 # DESCRIÇÃO: Configuração automática de conectividade iSCSI com discovery
+# VERSÃO: 2.2 - Discovery Automático com Interface Corrigida
 # AUTOR: sandro.cicero@loonar.cloud
 # ============================================================================
 
