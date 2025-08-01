@@ -166,7 +166,8 @@ sleep 10
 # Detectar dispositivos
 DEVICES=""
 for i in {1..10}; do
-    DEVICES=$(lsscsi 2>/dev/null | grep -E "(IET|LIO|SCST)" | awk '{print $6}' | head -1)
+    # Procura por discos PROXMOX FC-SIM ou qualquer outro disco conectado via iSCSI
+    DEVICES=$(lsscsi 2>/dev/null | grep -E "disk.*PROXMOX.*FC-SIM|disk.*IET" | awk '{print $NF}' | grep -v '^-$' | head -1)
     [[ -n "$DEVICES" ]] && break
     echo "Aguardando dispositivos... ($i/10)"
     sleep 5
@@ -207,9 +208,18 @@ multipaths {
 }
 devices {
     device {
+        vendor "PROXMOX"
+        product "FC-SIM"
+        path_checker tur
+        path_grouping_policy multibus
+        failback immediate
+    }
+    device {
         vendor "IET"
         product "VIRTUAL-DISK"
         path_checker tur
+        path_grouping_policy multibus
+        failback immediate
     }
 }
 EOF
