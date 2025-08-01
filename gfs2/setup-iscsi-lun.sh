@@ -114,13 +114,14 @@ echo "InitiatorName=$INITIATOR" | sudo tee /etc/iscsi/initiatorname.iscsi >/dev/
 echo "Criando arquivo de configuração iSCSI..."
 # Primeiro, criar um arquivo mínimo para teste
 sudo tee /etc/iscsi/iscsid.conf >/dev/null <<EOF
-node.startup = automatic
-node.session.auth.authmethod = CHAP
+node.startup = manual
 node.session.auth.authmethod = None
-node.session.timeo.replacement_timeout = 120
+discovery.sendtargets.auth.authmethod = None
 node.conn.timeo.login_timeout = 15
+node.session.timeo.replacement_timeout = 120
 node.conn.timeo.logout_timeout = 15
 node.session.initial_login_retry_max = 8
+node.session.queue_depth = 32
 EOF
 
 # Verificar a configuração mínima
