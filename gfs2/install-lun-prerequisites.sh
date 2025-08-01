@@ -453,12 +453,16 @@ detect_available_devices() {
         local type="$2"
         local real_device
         
+        print_info "Tentando adicionar device: $device (tipo: $type)"
+        
         # Resolver link simbólico para o device real
         real_device=$(readlink -f "$device")
+        print_info "Device real: $real_device"
         
         # Verificar se já processamos este device
         for processed in "${processed_devices[@]}"; do
             if [[ "$processed" == "$real_device" ]]; then
+                print_info "Device já processado anteriormente: $real_device"
                 return 0
             fi
         done
@@ -482,7 +486,21 @@ detect_available_devices() {
             model=$(lsblk -dn -o MODEL "$device" 2>/dev/null | tr -d ' ' || echo "N/A")
             
             # Verificar se é um device do sistema ou já está em uso
-            if [[ -z "$mountpoint" ]] && ! pvs "$device" &>/dev/null; then
+            print_info "Verificando device $device:"
+            print_info "  - Mountpoint: '$mountpoint'"
+            print_info "  - Size: $size"
+            print_info "  - WWN: $wwn"
+            print_info "  - Vendor: $vendor"
+            print_info "  - Model: $model"
+            
+            # Verificar se é um device do sistema ou já está em uso como PV
+            local is_pv=false
+            if pvs "$device" &>/dev/null; then
+                is_pv=true
+                print_warning "Device $device já em uso como Physical Volume"
+            fi
+            
+            if [[ -z "$mountpoint" ]] && [[ "$is_pv" == "false" ]]; then
                 local info="$device - Tamanho: $size"
                 [[ "$wwn" != "N/A" ]] && info+=" - WWN: $wwn"
                 [[ "$vendor" != "N/A" ]] && info+=" - Vendor: $vendor"
@@ -490,10 +508,11 @@ detect_available_devices() {
                 [[ "$type" == "multipath" ]] && info+=" - DM: $dm_name"
                 
                 devices+=("$info")
-                print_info "Encontrado device $type: $info"
+                print_success "✅ Device $type adicionado: $info"
             else
-                [[ -n "$mountpoint" ]] && print_warning "Device $device montado em $mountpoint"
-                pvs "$device" &>/dev/null && print_warning "Device $device já em uso como Physical Volume"
+                if [[ -n "$mountpoint" ]]; then
+                    print_warning "Device $device montado em $mountpoint"
+                fi
             fi
         fi
     }
@@ -511,10 +530,18 @@ detect_available_devices() {
     
     print_info "Procurando devices multipath ativos..."
     
-    # Primeiro, vamos tentar o device específico fc-lun-cluster
+    # Primeiro, procurar o device específico fc-lun-cluster
     if [[ -b "/dev/mapper/fc-lun-cluster" ]]; then
-        print_info "Encontrado device fc-lun-cluster"
+        print_info "🎯 Encontrado device fc-lun-cluster"
         check_and_add_device "/dev/mapper/fc-lun-cluster" "multipath"
+    else
+        print_warning "Device /dev/mapper/fc-lun-cluster não encontrado como block device"
+        
+        # Tentar usando o device mapper diretamente
+        if [[ -b "/dev/dm-0" ]]; then
+            print_info "🔍 Encontrado device /dev/dm-0"
+            check_and_add_device "/dev/dm-0" "multipath"
+        fi
     fi
     
     # Depois, procurar outros devices multipath
