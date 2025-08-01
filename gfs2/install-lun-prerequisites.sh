@@ -635,6 +635,23 @@ detect_available_devices() {
 configure_lvm_cluster() {
     print_header "⚙️  Configurando LVM para Cluster"
     
+    # Verificar se DLM está ativo
+    print_info "Verificando status do DLM..."
+    if ! sudo pcs status | grep -q "dlm.*Started"; then
+        print_error "DLM não está ativo. Execute primeiro a configuração do cluster."
+        return 1
+    fi
+    print_success "DLM está ativo"
+    
+    # Verificar se lvmlockd está rodando
+    print_info "Verificando status do lvmlockd..."
+    if ! systemctl is-active --quiet lvmlockd; then
+        print_info "Iniciando lvmlockd..."
+        sudo systemctl start lvmlockd
+        sleep 5
+    fi
+    print_success "lvmlockd está ativo"
+    
     # Detectar device disponível
     local selected_device
     if ! selected_device=$(detect_available_devices); then
@@ -670,10 +687,19 @@ configure_lvm_cluster() {
         
         # Verificar se está em modo cluster
         local lock_type
-        lock_type=$(sudo vgs --noheadings -o lv_lock_type "$vg_name" 2>/dev/null | tr -d ' ' || echo "none")
+        lock_type=$(sudo vgs --noheadings -o lock_type "$vg_name" 2>/dev/null | tr -d ' ' || echo "none")
         
         if [[ "$lock_type" != "dlm" ]]; then
-            print_info "Convertendo Volume Group para modo cluster DLM..."
+            print_warning "Volume Group existente não está em modo cluster"
+            print_info "Removendo Volume Group antigo..."
+            
+            # Desativar e remover VG existente
+            sudo vgchange -an "$vg_name" 2>/dev/null || true
+            sudo vgremove -f "$vg_name" 2>/dev/null || true
+            sudo pvremove -f "$selected_device" 2>/dev/null || true
+            
+            # Recriar como cluster
+            print_info "Recriando Volume Group em modo cluster..."
             
             # Forçar cleanup de locks
             print_info "Limpando locks existentes..."
@@ -772,20 +798,21 @@ configure_lvm_cluster() {
             return 1
         fi
         
-        # Criar Volume Group cluster-aware
-        if sudo vgcreate --shared "$vg_name" "$selected_device"; then
+        # Criar Volume Group cluster-aware com DLM desde o início
+        print_info "Criando Volume Group com suporte a cluster..."
+        if sudo vgcreate --shared --locktype dlm "$vg_name" "$selected_device"; then
             print_success "Volume Group cluster-aware criado: $vg_name"
+            
+            # Iniciar locks imediatamente
+            if sudo vgchange --lockstart "$vg_name"; then
+                print_success "Locks iniciados com sucesso"
+            else
+                print_error "Falha ao iniciar locks"
+                return 1
+            fi
         else
             print_error "Falha ao criar Volume Group"
             return 1
-        fi
-        
-        # Iniciar locks DLM se possível
-        if sudo vgchange --locktype dlm "$vg_name" && sudo vgchange --lockstart "$vg_name"; then
-            print_success "Volume Group configurado com locks DLM"
-        else
-            print_warning "Falha ao configurar locks DLM - usando modo local"
-            sudo vgchange --locktype none "$vg_name" 2>/dev/null || true
         fi
         
         # Ativar Volume Group
