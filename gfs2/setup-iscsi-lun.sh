@@ -260,41 +260,78 @@ echo "✅ WWID: $WWID"
 echo "Configurando multipath..."
 [[ -f /etc/multipath.conf ]] && sudo cp /etc/multipath.conf /etc/multipath.conf.backup
 
+# Criar configuração mais simples primeiro
 sudo tee /etc/multipath.conf >/dev/null <<EOF
 defaults {
     user_friendly_names yes
     find_multipaths yes
+    path_selector "round-robin 0"
+    path_grouping_policy multibus
+    failback immediate
+    rr_weight uniform
+    no_path_retry fail
 }
+
+blacklist {
+    devnode "^(ram|raw|loop|fd|md|dm-|sr|scd|st)[0-9]*"
+    devnode "^hd[a-z]"
+    devnode "^cciss.*"
+}
+
+devices {
+    device {
+        vendor "PROXMOX|IET"
+        product ".*"
+        path_checker tur
+        path_selector "round-robin 0"
+        path_grouping_policy group_by_prio
+        failback immediate
+        prio alua
+        hardware_handler "1 alua"
+        rr_weight uniform
+        rr_min_io 100
+    }
+}
+
 multipaths {
     multipath {
         wwid $WWID
         alias $MULTIPATH_ALIAS
     }
 }
-devices {
-    device {
-        vendor "PROXMOX"
-        product "FC-SIM"
-        path_checker tur
-        path_grouping_policy multibus
-        failback immediate
-    }
-    device {
-        vendor "IET"
-        product "VIRTUAL-DISK"
-        path_checker tur
-        path_grouping_policy multibus
-        failback immediate
-    }
-}
 EOF
 
+# Debug do estado atual
+echo "Estado atual do multipath antes de reiniciar:"
+sudo multipath -ll
+sudo multipathd show paths
+echo "Configuração do multipath:"
+sudo multipathd show config
+
 # Inicializar multipath
+echo "Reiniciando serviço multipath..."
+sudo systemctl stop multipathd
+sudo multipath -F    # Limpa todos os mapas
+sudo rm -f /etc/multipath/bindings   # Remove bindings antigos
+sudo systemctl start multipathd
 sudo systemctl enable multipathd
-sudo systemctl restart multipathd
-sleep 10
-sudo multipath -r
-sleep 10
+
+echo "Aguardando serviço multipath iniciar..."
+sleep 5
+
+echo "Verificando estado do serviço multipathd:"
+sudo systemctl status multipathd
+
+echo "Rescaneando dispositivos..."
+sudo multipath -v3 -R   # Rescan verbose
+sleep 5
+
+echo "Criando mapa para o dispositivo..."
+sudo multipath -v3 -a /dev/sdb   # Adiciona dispositivo específico
+sleep 5
+
+echo "Status do multipath:"
+sudo multipath -ll
 
 # Verificar dispositivo final
 for i in {1..15}; do
