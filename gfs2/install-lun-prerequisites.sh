@@ -267,7 +267,8 @@ configure_cluster_resources() {
     
     # Configurar dependências entre recursos
     print_info "🔗 Configurando dependências de recursos..."
-    sudo pcs constraint order start dlm-clone then lvmlockd-clone 2>/dev/null || true
+    sudo pcs constraint order start dlm-clone \
+        && lvmlockd-clone 2>/dev/null || true
     sudo pcs constraint colocation add lvmlockd-clone with dlm-clone 2>/dev/null || true
     
     print_success "Recursos configurados com sucesso"
@@ -887,6 +888,54 @@ configure_lvm_cluster() {
 }
 
 # ============================================================================
+# CONFIGURAÇÃO DO ARQUIVO COROSYNC
+# ============================================================================
+
+configure_corosync() {
+    print_header "🔧 Configurando corosync.conf"
+
+    local corosync_file="/etc/corosync/corosync.conf"
+
+    if [[ ! -f "$corosync_file" ]]; then
+        print_error "Arquivo corosync.conf não encontrado em $corosync_file"
+        return 1
+    fi
+
+    # Backup do arquivo original
+    sudo cp "$corosync_file" "${corosync_file}.backup.$(date +%F_%T)"
+    print_success "Backup do corosync.conf criado"
+
+    # Adicionando configuração de exemplo
+    sudo bash -c "cat > $corosync_file" <<EOF
+    totem {
+        version: 2
+        secauth: on
+        cluster_name: $CLUSTER_NAME
+        transport: udpu
+    }
+
+    nodelist {
+        node {
+            ring0_addr: $NODE1_NAME
+            nodeid: 1
+        }
+        node {
+            ring0_addr: $NODE2_NAME
+            nodeid: 2
+        }
+    }
+
+    quorum {
+        provider: corosync_votequorum
+        two_node: 1
+    }
+EOF
+
+    print_success "Arquivo corosync.conf configurado com sucesso"
+    return 0
+}
+
+# ============================================================================
 # FUNÇÃO PRINCIPAL
 # ============================================================================
 
@@ -922,6 +971,11 @@ main() {
     # Configurar storage LVM
     if ! configure_lvm_cluster; then
         error_exit "Falha na configuração de storage LVM"
+    fi
+    
+    # Configurar corosync
+    if ! configure_corosync; then
+        error_exit "Falha na configuração do corosync"
     fi
     
     # Relatório final
