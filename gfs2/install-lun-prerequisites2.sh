@@ -4,7 +4,7 @@
 # DESCRIÇÃO: Instalação de pré-requisitos para GFS2 Enterprise
 #            + validação e auto-instalação de kernel com suporte a DLM
 #            + criação de FS GFS2 e montagem automática
-# VERSÃO: 2.2 - Enterprise Cluster Ready + DLM auto-fix + mount
+# VERSÃO: 2.3 - Ajuste de detecção de suporte a DLM
 # AUTOR: DevOps Team
 # ============================================================================
 
@@ -34,11 +34,9 @@ readonly MOUNT_POINT="/mnt/gfs2_volume"
 # ----------------------------------------------------------------------------
 # Detectar papel do nó
 detect_node_role() {
-  local ip
-  ip=$(ip route get 8.8.8.8 2>/dev/null | awk '/src/ {print $7}' || echo "")
+  local ip=$(ip route get 8.8.8.8 2>/dev/null | awk '/src/ {print $7}' || echo "")
   [[ "$ip" == "$NODE1_IP" ]] && echo "primary" || ([[ "$ip" == "$NODE2_IP" ]] && echo "secondary" || echo "unknown")
 }
-
 get_current_hostname() { hostname -s; }
 
 # ----------------------------------------------------------------------------
@@ -56,17 +54,18 @@ check_prerequisites() {
 }
 
 # ----------------------------------------------------------------------------
-# 2) Garantir kernel com suporte a DLM
+# 2) Garantir kernel com suporte a DLM (nova lógica)
 ensure_dlm_kernel_support() {
   print_header "🔍 Verificando suporte do kernel ao DLM"
-  if ! dpkg -l | grep -q "^ii  linux-generic "; then
-    print_warning "Instalando kernel genérico e extras"
+  if sudo modprobe dlm &>/dev/null && lsmod | grep -q '^dlm'; then
+    print_success "Módulo DLM disponível no kernel atual"
+  else
+    print_warning "Módulo DLM não encontrado; instalando kernel genérico e extras"
     sudo apt update -qq
     sudo apt install -y linux-generic linux-modules-extra-$(uname -r)
-    print_success "Kernel instalado; reinicie e execute novamente"
+    print_success "Kernel genérico instalado; reinicie e execute o script novamente"
     exit 0
   fi
-  print_success "Kernel genérico presente"
 }
 
 # ----------------------------------------------------------------------------
@@ -85,10 +84,13 @@ install_packages() {
   sudo apt update -qq
   local pkgs=(gfs2-utils corosync pacemaker pcs dlm-controld lvm2-lockd multipath-tools open-iscsi fence-agents resource-agents)
   for pkg in "${pkgs[@]}"; do
-    dpkg -l | grep -q "^ii  $pkg " && { print_success "$pkg já instalado"; continue; }
-    print_info "Instalando $pkg..."
-    sudo apt install -y "$pkg" &>/dev/null || error_exit "Falha ao instalar $pkg"
-    print_success "$pkg instalado"
+    if dpkg -l | grep -q "^ii  $pkg "; then
+      print_success "$pkg já instalado"
+    else
+      print_info "Instalando $pkg..."
+      sudo apt install -y "$pkg" &>/dev/null || error_exit "Falha ao instalar $pkg"
+      print_success "$pkg instalado"
+    fi
   done
   if ! sudo passwd -S hacluster 2>/dev/null | grep -q "P"; then
     echo 'hacluster:hacluster' | sudo chpasswd
@@ -241,7 +243,7 @@ EOF
 # ----------------------------------------------------------------------------
 # Fluxo principal
 main() {
-  print_header "🚀 Iniciando Instalação GFS2 Enterprise + mount"
+  print_header "🚀 Iniciando Instalação GFS2 Enterprise + Mount"
   print_info "Nó: $(get_current_hostname) | IP: $(ip route get 8.8.8.8 2>/dev/null | awk '/src/ {print $7}')"
   check_prerequisites
   ensure_dlm_kernel_support
@@ -257,7 +259,7 @@ main() {
 # ----------------------------------------------------------------------------
 # Execução
 case "${1:-}" in
-  --help|-h)  echo "Uso: $0 [--help] [--version]"; exit 0 ;;
-  --version)  echo "Versão 2.2"; exit 0 ;;
+  --help|-h)  echo "Uso: $0 [--help] [--version]" && exit 0 ;;
+  --version)  echo "Versão 2.3" && exit 0 ;;
   *)          main ;;
 esac
